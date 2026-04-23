@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+ssm_regimes.egg-info/PKG-INFO
+ssm_regimes.egg-info/SOURCES.txt
+ssm_regimes.egg-info/dependency_links.txt
+ssm_regimes.egg-info/requires.txt
+ssm_regimes.egg-info/top_level.txt

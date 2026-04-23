@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssm_regimes"
+version = "0.1.0"
+description = "Regime-model extensions to ssm: uniform fit wrappers, causal filters, restricted EM, CUSUM overlay, and regime-evaluation utilities."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Chris Mader", email = "cmader2@jh.edu" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "ssm @ git+https://github.com/lindermanlab/ssm.git",
+]
+
+[project.urls]
+Source = "https://github.com/chrismader1/ssm_regimes"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ssm_regimes*"]
