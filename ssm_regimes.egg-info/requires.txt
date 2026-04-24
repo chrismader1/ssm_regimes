@@ -1,6 +1,0 @@
-numpy
-pandas
-scipy
-scikit-learn
-matplotlib
-ssm @ git+https://github.com/lindermanlab/ssm.git
