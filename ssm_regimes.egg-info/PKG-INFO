@@ -1,0 +1,95 @@
+Metadata-Version: 2.4
+Name: ssm_regimes
+Version: 0.1.0
+Summary: Regime-model extensions to ssm: uniform fit wrappers, causal filters, restricted EM, CUSUM overlay, and regime-evaluation utilities.
+Author-email: Chris Mader <cmader2@jh.edu>
+License: MIT
+Project-URL: Source, https://github.com/chrismader1/ssm_regimes
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scipy
+Requires-Dist: scikit-learn
+Requires-Dist: matplotlib
+Requires-Dist: ssm @ git+https://github.com/lindermanlab/ssm.git
+
+# ssm_regimes
+
+Regime-model extensions to [lindermanlab/ssm](https://github.com/lindermanlab/ssm).
+
+Provides uniform fit wrappers and causal filters for rSLDS, HMM, and AR-HMM
+models, a restricted-EM variant of rSLDS, a SPRT-optimal CUSUM overlay for
+regime-change detection, and generic regime-evaluation utilities.
+Domain-agnostic.
+
+## Installation
+
+```bash
+pip install git+https://github.com/chrismader1/ssm_regimes.git
+```
+
+Pulls `ssm` from the Linderman lab repo automatically.
+
+## Public API
+
+```python
+from ssm_regimes import (
+    # Fit wrappers (uniform signature across model families)
+    fit_rSLDS, fit_rSLDS_restricted, fit_HMM, fit_AR_HMM,
+
+    # Causal (forward-only) inference
+    inference_rSLDS, inference_HMM, inference_ARHMM, filter_states_causal,
+
+    # Regime-change detection
+    cusum_overlay,
+
+    # Evaluation (synthetic + actual data)
+    evaluate_regimes_synthetic, evaluate_regimes_actual,
+
+    # Bounds and diagnostics
+    max_cpll_causal_bound, compute_stability_margin,
+
+    # Parameter utilities
+    print_rSLDS_matrices, get_rSLDS_params, compute_required_w,
+)
+```
+
+## Key contributions over base ssm
+
+- **Uniform fit API**: `fit_rSLDS`, `fit_HMM`, `fit_AR_HMM` all return the same
+  `(xhat, zhat, elbo, q, mdl)` tuple so downstream code is model-agnostic.
+- **Restricted EM** (`fit_rSLDS_restricted`): fits rSLDS with fixed-or-masked
+  `C, d` emission matrices for interpretable, identification-constrained models.
+- **Causal filters** (`inference_rSLDS` / `_HMM` / `_ARHMM`): strictly
+  forward-only IMM / alpha-recursion filters. No look-ahead. Returns xhat,
+  zhat, gamma, cpll, and a diagonal-Gaussian upper bound max_cpll.
+- **CUSUM overlay** (`cusum_overlay`): SPRT-optimal regime-change detection
+  on top of a fitted model. One threshold `h_z` (nats) governs changepoint
+  sensitivity across all three model families.
+- **Generic evaluators**: `evaluate_regimes_{synthetic,actual}` return label-
+  invariant classification metrics, changepoint detection stats, stability
+  margins, ELBO and CPLL diagnostics. No trading or domain assumptions.
+
+## Citation
+
+If you use this code, please cite:
+
+> Mader, C. (2026). *Unsupervised Financial Regime Detection with Recurrent
+> Switching Linear Dynamical Systems.* Johns Hopkins University.
+> [paper link / SSRN link].
+
+## Related packages
+
+- [`ssm_regimes_trading`](https://github.com/chrismader1/ssm_regimes_trading)
+  — trading overlay (PnL evaluation, rolling-window gridsearch)
+- [`ssm_regimes_experiments`](https://github.com/chrismader1/ssm_regimes_experiments)
+  — reference implementation of the experiments in the paper
+
+## Author
+
+Chris Mader, Johns Hopkins University &lt;cmader2@jh.edu&gt;
+
+## License
+
+MIT.

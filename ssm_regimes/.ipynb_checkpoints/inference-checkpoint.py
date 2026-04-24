@@ -42,9 +42,9 @@ def inference_rSLDS(px, mdl, y, dt=1/252, display=False, x0_var=1.0):
     R_diag = np.exp(np.asarray(mdl.emissions.inv_etas, dtype=float)[0])  # (N,)
     R  = np.diag(R_diag)                                    # (N, N)
     # recurrent transitions
-    # RecurrentOnlyTransitions has no base log_Ps — logits depend only on Rs @ x + r
+    log_Ps_base = np.asarray(mdl.transitions.log_Ps, dtype=float)  # (K, K)
+    log_Ps_base = log_Ps_base - _lse(log_Ps_base, axis=1, keepdims=True)
     Rs = np.asarray(mdl.transitions.Rs, dtype=float)        # (K, D)
-    r  = np.asarray(mdl.transitions.r,  dtype=float)        # (K,)
     # initial state distribution
     log_pi0 = np.asarray(mdl.init_state_distn.log_pi0, dtype=float)  # (K,)
     pi0 = np.exp(log_pi0 - _lse(log_pi0))
@@ -77,11 +77,9 @@ def inference_rSLDS(px, mdl, y, dt=1/252, display=False, x0_var=1.0):
             # i.e. the recurrent effect is additive on column j and shared across
             # rows k. In IMM each source regime k carries its own mean mu[k],
             # so we build a K x K transition matrix using mu[k] as the source state.
-            # RecurrentOnly: logits depend only on source-state mean mu[k] → Rs @ mu[k] + r
-            # Same logits across all source rows k (no base-matrix k-dependence).
             log_Ps_full = np.zeros((K, K))
             for k in range(K):
-                logits = (Rs @ mu[k]) + r                   # (K,)
+                logits = log_Ps_base[k, :] + (Rs @ mu[k])   # (K,)
                 log_Ps_full[k, :] = logits - _lse(logits)
             P = np.exp(log_Ps_full)                         # (K, K) row-stochastic
 
