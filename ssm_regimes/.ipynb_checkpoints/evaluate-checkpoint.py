@@ -33,7 +33,7 @@ from .bounds import compute_stability_margin
 
 
 def evaluate_regimes_synthetic(y, xhat, zhat, z_true, elbo, mdl, cpll, max_cpll,
-                               model_type, label_invariant=True):
+                               label_invariant=True):
     """
     Generic synthetic-data regime evaluation. Pure computation, no plotting.
 
@@ -131,7 +131,7 @@ def evaluate_regimes_synthetic(y, xhat, zhat, z_true, elbo, mdl, cpll, max_cpll,
     detection_lag_mean = np.mean(lag_list) if lag_list else np.nan
 
     # ---- Stability margin ----
-    stability_margins, stability_decision = compute_stability_margin(mdl, model_type)
+    stability_margins, stability_decision = compute_stability_margin(mdl)
 
     # ---- ELBO diagnostics ----
     if elbo is not None:
