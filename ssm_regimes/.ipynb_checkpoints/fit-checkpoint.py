@@ -203,54 +203,20 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
  
     # attach
     mdl.emissions._invert = _invert_ridge.__get__(mdl.emissions, mdl.emissions.__class__)
-
-    # ----- initialisation: parity with fit_rSLDS (unrestricted)
-    # Original fit_rSLDS_restricted set ALL K regimes to identical dynamics
-    # (As = 0.95*I, bs = 0, sigmasq = 1) with only a tiny 0.01-stddev random
-    # perturbation on transitions.Rs. With identical per-regime dynamics, EM
-    # converges to a symmetric attractor where regimes collapse to copies of
-    # each other — explains "same poor results regardless of K" symptom.
-    #
-    # Fix: use the same init path as fit_rSLDS — call mdl.initialize(y) which
-    # runs k-means on y to derive distinct per-regime dynamics, with the same
-    # N<D*K fallback to manual init when PCA can't extract D components.
-    # After init, re-pin emissions to the fixed (C, d) since initialize(y)
-    # would have overwritten them.
-    if fixed_emissions and N < D * K:
-        # k-means init can't run (PCA needs N >= D); use manual per-regime
-        # init that breaks symmetry across K via random perturbations.
+ 
+    # ----- initial dynamics & gates (stable + symmetry breaking)
+    mdl.dynamics.As = np.repeat(0.95 * np.eye(D)[None, :, :], K, axis=0)  # (K,D,D)
+    mdl.dynamics.bs = np.zeros((K, D))
+    mdl.dynamics.sigmasq = np.ones((K, D))
+    mdl.dynamics.mu_init = np.zeros((K, D))
+    mdl.dynamics.sigmasq_init = np.ones((K, D))
+    if hasattr(mdl.transitions, "Rs"):
+        mdl.transitions.Rs = 0.01 * npr.randn(K, D)  # break symmetry for stick-breaking gates
+    if hasattr(mdl.transitions, "r"):
+        mdl.transitions.r = np.zeros(K)
+    if hasattr(mdl.init_state_distn, "log_pi0"):
         mdl.init_state_distn.log_pi0 = np.log(np.full(K, 1.0 / K))
-        mdl.dynamics.mu_init     = np.zeros((K, D))
-        mdl.dynamics.sigmasq_init = np.ones((K, D))
-        # Per-regime random perturbation of dynamics so regimes are NOT
-        # identical at init. Spread diagonals across [0.85, 0.99] then add
-        # small random noise.
-        diag_seed = np.linspace(0.85, 0.99, K)
-        As_init = np.zeros((K, D, D))
-        for k in range(K):
-            As_init[k] = np.diag(np.full(D, diag_seed[k])) + 0.01 * npr.randn(D, D)
-            # keep diagonal-dominant, clip diag for stability
-            np.fill_diagonal(As_init[k], np.clip(np.diag(As_init[k]), -0.999, 0.999))
-        mdl.dynamics.As     = As_init
-        mdl.dynamics.bs      = 0.01 * npr.randn(K, D)        # small random b per regime
-        mdl.dynamics.sigmasq = 1e-4 * np.ones((K, D))
-        mdl.transitions.Rs   = 0.1 * npr.randn(K, D)         # larger perturbation than 0.01
-        mdl.transitions.r    = np.zeros(K)
-    else:
-        # k-means based init via ssm's built-in
-        mdl.initialize(y)
-
-    # If emissions are fixed, re-pin (initialize(y) overwrites Cs/ds/inv_etas
-    # via PCA on y, which is wrong when we want C, d locked to user values).
-    if fixed_emissions:
-        obs_var = np.var(y, axis=0)
-        obs_var = np.clip(np.nan_to_num(obs_var, nan=1.0, posinf=1e6, neginf=1e6), 1e-8, 1e6)
-        inv_etas_row = np.log(1.0 / obs_var)[None, :]
-        inv_etas     = np.tile(inv_etas_row, (K, 1))
-        mdl.emissions.Cs       = C[None, :, :]
-        mdl.emissions.ds       = d[None, :]
-        mdl.emissions.inv_etas = inv_etas
-
+ 
     # store µ for reporting (µ = b/(1-ρ))
     mdl.dynamics_mu_param = np.zeros((K, D))
  
