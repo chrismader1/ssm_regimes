@@ -25,10 +25,6 @@ def cusum_overlay(prices, y, xhat, mdl, h_z, model_type, verbose=False):
     import matplotlib.pyplot as plt
     from scipy.special import logsumexp
 
-    # h_z=None means if use_cusum is False, return None and let callers fall back
-    if h_z is None:
-        return None
-        
     # short series guard
     if xhat.shape[0] <= 10:
         return None
