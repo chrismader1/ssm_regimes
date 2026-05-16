@@ -10,16 +10,24 @@ from .bounds import max_cpll_causal_bound
 # rSLDS Inference
 # ---------------------------------------------------------------
 
-def inference_rSLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False):
+def inference_rSLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False,
+                    inference_mode="smoothed"):
     """
-    Look-ahead-free expanding-window smoothed inference for a fitted rSLDS.
+    OOS inference for a fitted rSLDS in one of two modes.
 
-    Uses ssm's native variational machinery (structured-meanfield smoothed
-    posterior) rather than a hand-rolled IMM. The model architecture being
-    evaluated includes ssm's inference layer; using a custom filter would
-    measure the wrong thing.
+    inference_mode="online" (default for deployable backtests):
+      Strictly causal cadence-stepped expanding-window smoothed inference.
+      At each decision point t_d, smooth on y[0:t_d] and broadcast the
+      rightmost label across the next `cadence` days. No look-ahead.
 
-    Inference pattern:
+    inference_mode="smoothed" (for benchmarking / model comparison):
+      Single structured-meanfield smoothed inference on the OOS block
+      y[T_train:T]. Each OOS day's label uses past AND future data within
+      the OOS block — leaks future information. Use only for comparing model
+      classes (rSLDS vs HMM) under identical evaluation protocol; do not
+      interpret resulting CAGR as live-trading return.
+
+    Inference pattern (online mode):
       1. Training portion (t = 0 .. T_train - 1):
          single smoothed inference call on y[0:T_train]. Training labels are
          in-sample by design — smoothing here is fine.
@@ -68,6 +76,8 @@ def inference_rSLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False):
     cadence = int(cadence)
     assert cadence >= 1, f"cadence must be >= 1, got {cadence}"
     assert 0 <= T_train <= T, f"T_train={T_train} out of range for T={T}"
+    assert inference_mode in ("online", "smoothed"), \
+        f"inference_mode must be 'online' or 'smoothed', got {inference_mode!r}"
 
     K = int(mdl.K)
     D = int(mdl.D)
@@ -97,6 +107,31 @@ def inference_rSLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False):
         # single number by design (diagnostic only; matches old rSLDS.py behaviour).
         cpll = _smoothed_cpll_proxy(g_full)
         return {"xhat": x_full, "zhat": z_full.astype(int), "gamma": g_full,
+                "cpll": float(cpll), "max_cpll": float(max_cpll), "mdl": mdl}
+
+    # --- smoothed mode: single smoothed inference on the OOS block ---
+    # Used for benchmarking model classes under identical protocol. Each OOS
+    # day's label uses past AND future data within the OOS block (leaky).
+    if inference_mode == "smoothed":
+        xhat = np.zeros((T, D))
+        zhat = np.zeros(T, dtype=int)
+        gamma = np.zeros((T, K))
+        # training portion: smoothed inference on training data alone (matches online mode for IS)
+        if T_train > 0:
+            x_tr, z_tr, g_tr = _smooth(y[:T_train])
+            xhat[:T_train]  = x_tr
+            zhat[:T_train]  = z_tr.astype(int)
+            gamma[:T_train] = g_tr
+        # OOS portion: single smoothed inference on the OOS block alone
+        x_oos, z_oos, g_oos = _smooth(y[T_train:])
+        xhat[T_train:]  = x_oos
+        zhat[T_train:]  = z_oos.astype(int)
+        gamma[T_train:] = g_oos
+        # CPLL diagnostic on full sequence
+        x_full, _, g_full = _smooth(y)
+        cpll = _smoothed_cpll_proxy(g_full)
+        max_cpll = max_cpll_causal_bound(y, reg_scale=1e-8)
+        return {"xhat": xhat, "zhat": zhat, "gamma": gamma,
                 "cpll": float(cpll), "max_cpll": float(max_cpll), "mdl": mdl}
 
     # --- training portion: one smoothed call on y[0:T_train] ---
