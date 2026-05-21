@@ -416,29 +416,53 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
  
     for _ in range(int(n_iter_em)):
  
-        # E-only
+        # E-only — with deterministic-perturbation retry on AssertionError
+        # from ssm/lds.py (NaN in expected log-prob during Newton step).
+        # Cause: regime collapse to zero responsibility under fixed-C
+        # restricted emissions. Fix: perturb dynamics.bs deterministically
+        # (seeded from iter index) and re-run the same iteration.
+        # Reproducible because perturbation is deterministic in (iter, attempt).
         _freeze_all()
-        elbo_E, q = mdl.fit(
-            y,
-            method="laplace_em",
-            variational_posterior="structured_meanfield",
-            num_iters=1,
-            alpha=0.0,
-            initialize=False)
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                elbo_E, q = mdl.fit(
+                    y,
+                    method="laplace_em",
+                    variational_posterior="structured_meanfield",
+                    num_iters=1,
+                    alpha=0.0,
+                    initialize=False)
+                break
+            except AssertionError:
+                if attempt == max_attempts - 1:
+                    raise
+                # Deterministic perturbation: seeded numpy state from
+                # (iter, attempt) so reruns yield identical bs perturbation.
+                rng = np.random.RandomState(seed=hash(("E", _, attempt)) % (2**31 - 1))
+                mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
         elbo_trace.extend(list(elbo_E))
- 
-        # M-enabled
+    
+        # M-enabled — same retry pattern.
         _enable_M_pass()
-        elbo_M, q = mdl.fit(
-            y,
-            method="laplace_em",
-            variational_posterior="structured_meanfield",
-            num_iters=1,
-            alpha=0.0,
-            initialize=False)
+        for attempt in range(max_attempts):
+            try:
+                elbo_M, q = mdl.fit(
+                    y,
+                    method="laplace_em",
+                    variational_posterior="structured_meanfield",
+                    num_iters=1,
+                    alpha=0.0,
+                    initialize=False)
+                break
+            except AssertionError:
+                if attempt == max_attempts - 1:
+                    raise
+                rng = np.random.RandomState(seed=hash(("M", _, attempt)) % (2**31 - 1))
+                mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
         elbo_trace.extend(list(elbo_M))
         q_last = q
- 
+
         # identifiability constraints (after M)
         _enforce_identifiability_and_mu()
         # FIX (BUG 1): only project when emissions are restricted; otherwise
