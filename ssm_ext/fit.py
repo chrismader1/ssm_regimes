@@ -100,9 +100,13 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None):
 
     # INITIALIZE MODEL
 
-    if N < D * K:
+    if N < D * K or D >= N:
 
-        # ssm.SLDS.initialize cannot be used here. It runs PCA on y, then
+        # ssm.SLDS.initialize cannot be used here.
+        # The `D >= N` clause also covers single_subspace K=1 with N == D: there
+        # the PCA in ssm's initializer explains all of y, noise_variance_ = 0,
+        # and inv_etas = log(0) = -inf (emissions.py:394). That case satisfies
+        # N >= D*K (so the N < D*K guard misses it) yet still must skip PCA. It runs PCA on y, then
         # builds C via (random_orthogonal @ pca.components_). When D*Keff > N
         # that matmul fails with a shape mismatch; when D*Keff == N it runs
         # but PCA's noise_variance_ is 0, so ssm sets inv_etas = log(0) = -inf,
@@ -210,6 +214,29 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None):
 
     else:
         mdl.initialize(y)  #, discrete_state_init_method="kmeans")  # default
+
+    # --- emission-variance floor (critical for the K=1 T1b nulls) ---
+    # ssm stores the emission VARIANCE as etas = exp(inv_etas). It can reach 0
+    # (-> inv_etas = -inf -> 1/exp(inv_etas) = inf in the Laplace E-step Hessian
+    # at emissions.py:400 -> non-finite curvature -> AssertionError -> the fit is
+    # skipped) two ways, both seen for K=1:
+    #   (1) init: mdl.initialize runs PCA; when the latent fully explains y
+    #       (K=1 with N == D) PCA noise_variance_ = 0 -> inv_etas = log(0). The
+    #       manual-init branch only guards N < D*K, so N == D slips through here.
+    #   (2) EM: with one regime the emissions M-step can drive the residual
+    #       variance to ~0.
+    # Floor inv_etas from below. Variance floor 1e-4 sits far under the z-scored
+    # data scale (~1), so it binds only on degenerate collapse and leaves the
+    # K>=2 fits (residual variance O(0.01-1)) unchanged.
+    _INV_ETAS_MIN = float(np.log(1e-4))
+    mdl.emissions.inv_etas = np.maximum(
+        np.nan_to_num(mdl.emissions.inv_etas, neginf=_INV_ETAS_MIN, nan=_INV_ETAS_MIN),
+        _INV_ETAS_MIN)
+    _emi_mstep_base_uns = mdl.emissions.m_step
+    def _emi_mstep_floored(*a, **k):
+        _emi_mstep_base_uns(*a, **k)
+        mdl.emissions.inv_etas = np.maximum(mdl.emissions.inv_etas, _INV_ETAS_MIN)
+    mdl.emissions.m_step = _emi_mstep_floored
 
     # FIT MODEL
     elbo, q = mdl.fit(y,
