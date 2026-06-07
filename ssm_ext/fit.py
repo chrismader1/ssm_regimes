@@ -436,6 +436,7 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
 def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     b_pattern=None, enforce_diag_A=True,
     q_min=1e-6,              # floor on dynamics variance
+    alpha_damp=0.5,          # Laplace-EM damping: new=(1-a)*Mstep+a*old; >0 prevents overshoot
     C_mask=None, d_mask=None):
 
     """
@@ -480,6 +481,14 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     if b_pattern is None:
         b_pattern = ["mu_form"] * D
     assert len(b_pattern) == D and all(m in {"free", "zero", "mu_form"} for m in b_pattern)
+
+    # Whether any emission entry is FREE to learn (factor1 / factor1_vix: the factor
+    # loadings c_i are learned). Fully-fixed models (fund*, factor2*) have all-zero
+    # masks and keep emissions locked. This is what lets the c_i actually be estimated
+    # rather than staying pinned at their 0 init.
+    has_learnable_emissions = (
+        (C_mask is not None and np.any(np.asarray(C_mask) != 0)) or
+        (d_mask is not None and np.any(np.asarray(d_mask) != 0)))
 
     # ----- model
     mdl = ssm.SLDS(
@@ -667,6 +676,24 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         # floor process variances
         if hasattr(mdl.dynamics, "sigmasq"):
             mdl.dynamics.sigmasq = np.maximum(mdl.dynamics.sigmasq, q_min)
+        # Enforce identifiability EVERY M-step (previously applied only once per
+        # outer iteration). With the single coupled laplace_em below, folding the
+        # A-persistence clip and b zero-pattern in here keeps every internal
+        # iteration constrained, preventing the A->unit-root drift / overshoot
+        # that produced the non-monotonic ELBO blow-ups.
+        A = mdl.dynamics.As
+        for k in range(K):
+            if enforce_diag_A:
+                A[k] = np.diag(np.clip(np.diag(A[k]), -a_max, a_max))
+            else:
+                di = np.clip(np.diag(A[k]), -a_max, a_max)
+                np.fill_diagonal(A[k], di)
+        mdl.dynamics.As = A
+        B = mdl.dynamics.bs
+        for d_idx, mode in enumerate(b_pattern):
+            if mode == "zero":
+                B[:, d_idx] = 0.0
+        mdl.dynamics.bs = B
 
     def trn_mstep_plain(*args, **kwargs):
         if K == 1:
@@ -677,8 +704,17 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         mdl.dynamics.m_step = dyn_mstep_plain
         mdl.transitions.m_step = trn_mstep_plain
         mdl.init_state_distn.m_step = pio_mstep_base
-        # emissions: only if unrestricted
-        mdl.emissions.m_step = (lambda *_, **__: None) if fixed_emissions else emi_mstep_base
+        # Emissions:
+        #   - unrestricted        -> learn full C (ssm base m_step)
+        #   - factor1 / _vix      -> learn the C_mask=1 loadings, then clamp fixed cells
+        #                            (emi_mstep_masked); this is what estimates c_i
+        #   - fund* / factor2*    -> fully fixed (no learnable cells) -> locked
+        if not fixed_emissions:
+            mdl.emissions.m_step = emi_mstep_base
+        elif has_learnable_emissions:
+            mdl.emissions.m_step = emi_mstep_masked
+        else:
+            mdl.emissions.m_step = (lambda *_, **__: None)
 
     def _enforce_identifiability_and_mu():
         # Honors enforce_diag_A. If False, keep off-diagonals; only
@@ -756,80 +792,56 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         emissions.Cs = C_mask * Cs + (1.0 - C_mask) * C_fix
         emissions.ds = d_mask * ds + (1.0 - d_mask) * d_fix
 
+    def emi_mstep_masked(*args, **kwargs):
+        # Run ssm's emissions M-step so the FREE loadings (C_mask=1) are estimated,
+        # then clamp the FIXED cells (C_mask=0 / d_mask=0) back to C, d. Net effect:
+        # factor1/_vix learn c_i while the VIX row [0..0,1] and d=0 stay fixed.
+        emi_mstep_base(*args, **kwargs)
+        # ssm's single_subspace emissions M-step collapses inv_etas to (1,N); the
+        # manual init uses (K,N). Restore (K,N) so the flattened emissions-param
+        # length is stable across the M-step (ssm's laplace-EM damping requires it).
+        ie = np.asarray(mdl.emissions.inv_etas)
+        if ie.ndim == 2 and ie.shape[0] == 1 and K > 1:
+            mdl.emissions.inv_etas = np.tile(ie, (K, 1))
+        _project_emissions_(mdl.emissions, C_fix=C, d_fix=d, C_mask=C_mask, d_mask=d_mask)
 
-    # ----- outer split-EM (alpha=0.0)
+
+    # ----- coupled Laplace-EM (single ssm fit)
+    # Replaces the previous hand-rolled split (E-only pass then M-enabled pass,
+    # each a separate num_iters=1 laplace_em with alpha=0.0, constraints applied
+    # BETWEEN calls). That split produced non-monotonic ELBO blow-ups (e.g.
+    # -684448 spikes) and, on less-stable families, an inf/NaN that hard-crashed
+    # ssm's message passing. Here ssm runs the E/M coupling itself for n_iter_em
+    # iterations with damping (alpha_damp), and the constrained dynamics m_step
+    # (A-clip, b zero-pattern, sigmasq floor) is enforced at every iteration.
+    # Emissions stay locked when fixed_emissions (m_step is a no-op via _enable_M_pass).
     elbo_trace = []
     q_last = None
+    _enable_M_pass()
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            elbo, q_last = mdl.fit(
+                y,
+                method="laplace_em",
+                variational_posterior="structured_meanfield",
+                num_iters=int(n_iter_em),
+                alpha=alpha_damp,
+                initialize=False)
+            break
+        except AssertionError:
+            if attempt == max_attempts - 1:
+                raise
+            # Deterministic perturbation of bs (seeded by attempt) so reruns
+            # are reproducible; nudges off a collapsed-responsibility init.
+            rng = np.random.RandomState(seed=hash(("EM", attempt)) % (2**31 - 1))
+            mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
+    elbo_trace.extend(list(elbo))
 
-    for _iter in range(int(n_iter_em)):
-
-        # E-only — with deterministic-perturbation retry on AssertionError
-        # from ssm/lds.py (NaN in expected log-prob during Newton step).
-        # Cause: regime collapse to zero responsibility under fixed-C
-        # restricted emissions. Fix: perturb dynamics.bs deterministically
-        # (seeded from iter index) and re-run the same iteration.
-        # Reproducible because perturbation is deterministic in (iter, attempt).
-        _freeze_all()
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            try:
-                elbo_E, q = mdl.fit(
-                    y,
-                    method="laplace_em",
-                    variational_posterior="structured_meanfield",
-                    num_iters=1,
-                    alpha=0.0,
-                    initialize=False)
-                break
-            except AssertionError:
-                if attempt == max_attempts - 1:
-                    raise
-                # Deterministic perturbation: seeded numpy state from
-                # (iter, attempt) so reruns yield identical bs perturbation.
-                rng = np.random.RandomState(seed=hash(("E", _iter, attempt)) % (2**31 - 1))
-                mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
-        elbo_trace.extend(list(elbo_E))
-
-        # M-enabled — same retry pattern.
-        _enable_M_pass()
-        for attempt in range(max_attempts):
-            try:
-                elbo_M, q = mdl.fit(
-                    y,
-                    method="laplace_em",
-                    variational_posterior="structured_meanfield",
-                    num_iters=1,
-                    alpha=0.0,
-                    initialize=False)
-                break
-            except AssertionError:
-                if attempt == max_attempts - 1:
-                    raise
-                rng = np.random.RandomState(seed=hash(("M", _iter, attempt)) % (2**31 - 1))
-                mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
-        elbo_trace.extend(list(elbo_M))
-
-        q_last = q
-
-        # identifiability constraints (after M)
-        _enforce_identifiability_and_mu()
-        # only project when emissions are restricted; otherwise C_fix/d_fix
-        # are None and np.asarray would crash.
-        if fixed_emissions:
-            _project_emissions_(mdl.emissions, C_fix=C, d_fix=d, C_mask=C_mask, d_mask=d_mask)
-
-    # Final E-only (sharpen posterior)
-    _freeze_all()
-    elbo_F, q_last = mdl.fit(
-        y,
-        method="laplace_em",
-        variational_posterior="structured_meanfield",
-        num_iters=1,
-        alpha=0.0,
-        initialize=False)
-    elbo_trace.extend(list(elbo_F))
-
-    # outputs
+    # final identifiability + emission projection (one authoritative pass)
+    _enforce_identifiability_and_mu()
+    if fixed_emissions:
+        _project_emissions_(mdl.emissions, C_fix=C, d_fix=d, C_mask=C_mask, d_mask=d_mask)
     xhat = q_last.mean_continuous_states[0]
     zhat = mdl.most_likely_states(xhat, y)
     return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_last, mdl
