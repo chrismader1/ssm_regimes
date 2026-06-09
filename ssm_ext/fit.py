@@ -10,7 +10,7 @@ from .init import fit_kmeans
 
 import autograd.numpy as _anp
 from autograd.scipy.special import logsumexp as _ag_logsumexp
-from ssm.transitions import RecurrentOnlyTransitions as _RecOnly
+from ssm.transitions import RecurrentOnlyTransitions as _RecOnly, StationaryTransitions as _Stationary
 
 
 # ---------------------------------------------------------------
@@ -54,6 +54,71 @@ class StickyRecurrentOnly(_RecOnly):
             data, input, mask, tag)
         lp = lp + self.kappa * _anp.eye(self.K)[None, :, :]
         return lp - _ag_logsumexp(lp, axis=2, keepdims=True)
+
+
+class StickyStandard(_Stationary):
+    """Standard (time-homogeneous) transitions carrying the SAME Fox-2011 self-
+    transition stickiness as StickyRecurrentOnly. A fixed scalar kappa is added to
+    the diagonal of the per-step log transition matrix and then renormalised -- the
+    IDENTICAL treatment applied to the recurrent sticky gate -- so an rSLDS-vs-SLDS
+    comparison differs ONLY in the transition functional form (recurrent R.x vs a
+    fixed K x K matrix), not in the stickiness regularisation:
+
+        log p(z_t=j | z_{t-1}=i) = log_Ps[i,j] + kappa * 1[i==j]   (then renormalised)
+
+    kappa is a constant; not added to params, not optimised in the M-step.
+    """
+
+    def __init__(self, K, D, M, kappa):
+        super(StickyStandard, self).__init__(K, D, M=M)
+        self.kappa = float(kappa)
+
+    def log_transition_matrices(self, data, input, mask, tag):
+        lp = super(StickyStandard, self).log_transition_matrices(
+            data, input, mask, tag)
+        lp = lp + self.kappa * _anp.eye(self.K)[None, :, :]
+        return lp - _ag_logsumexp(lp, axis=2, keepdims=True)
+
+
+# ---------------------------------------------------------------
+# Shared warm-up: closed-form (k-means) seed + occupancy-revert anchor
+# ---------------------------------------------------------------
+
+def _closed_form_warmstart(mdl, y, params, *, closed_form_fn, trans_param_names,
+                           C=None, d=None, n_iter_em=10, seed=None, b_pattern=None,
+                           enforce_diag_A=True, C_mask=None, d_mask=None, q_min=1e-6,
+                           copy_emissions=True):
+    """Seed `mdl` from a closed-form (k-means) fit and return the base_state that the
+    occupancy-revert guardrail falls back to. Shared by every EM fitter
+    (restricted/unrestricted, rSLDS/SLDS) so all four warm up by the SAME procedure;
+    only `closed_form_fn` (recurrent vs standard gate) and `trans_param_names`
+    (("Rs","r") vs ("log_Ps",)) differ.
+
+    For unrestricted fits the caller passes an initial C,d (e.g. identity/PCA) so the
+    closed-form seed is well defined; the subsequent EM is free to relearn the
+    emissions. Returns base_state (xhat, zhat, q, base_mdl, base_occ), or None if the
+    closed-form fit raises (the caller then keeps its own cold init)."""
+    K = int(params["n_regimes"])
+    try:
+        x_base, z_base, _eb, q_base, base_mdl = closed_form_fn(
+            y, params, C=C, d=d, n_iter_em=n_iter_em, seed=seed,
+            b_pattern=b_pattern, enforce_diag_A=enforce_diag_A,
+            C_mask=C_mask, d_mask=d_mask)
+    except Exception:
+        return None
+    mdl.dynamics.As      = np.array(base_mdl.dynamics.As, dtype=float)
+    mdl.dynamics.bs      = np.array(base_mdl.dynamics.bs, dtype=float)
+    mdl.dynamics.sigmasq = np.maximum(np.array(base_mdl.dynamics.sigmasq, dtype=float), q_min)
+    for nm in trans_param_names:
+        setattr(mdl.transitions, nm,
+                np.array(getattr(base_mdl.transitions, nm), dtype=float))
+    if copy_emissions:
+        mdl.emissions.Cs       = np.array(base_mdl.emissions.Cs, dtype=float)
+        mdl.emissions.ds       = np.array(base_mdl.emissions.ds, dtype=float)
+        mdl.emissions.inv_etas = np.array(base_mdl.emissions.inv_etas, dtype=float)
+    z_base = np.asarray(z_base, dtype=int)
+    base_occ = np.bincount(z_base, minlength=K) / max(z_base.size, 1)
+    return (x_base, z_base, q_base, base_mdl, base_occ)
 
 
 def _estimate_masked_loadings(C, d, y, C_mask):
@@ -281,6 +346,20 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None):
         mdl.emissions.inv_etas = np.maximum(mdl.emissions.inv_etas, _INV_ETAS_MIN)
     mdl.emissions.m_step = _emi_mstep_floored
 
+    # ---- shared warm-up: seed dynamics + discrete gate from the closed-form
+    #      (k-means) fit and keep it as the occupancy-revert anchor -- the SAME
+    #      procedure the restricted fitters use. Emissions are seeded from the current
+    #      init C,d and relearned by the (unrestricted) EM below; falls back silently
+    #      to the existing cold init if the closed-form seed is unavailable.
+    _wb_state = None
+    if K > 1 and bool(params.get("single_subspace", True)):
+        _C0 = np.array(mdl.emissions.Cs[0], dtype=float)
+        _d0 = np.array(mdl.emissions.ds[0], dtype=float)
+        _wb_state = _closed_form_warmstart(
+            mdl, y, params, closed_form_fn=fit_rSLDS_restricted,
+            trans_param_names=("Rs", "r"), C=_C0, d=_d0,
+            n_iter_em=n_iter_em, seed=seed, copy_emissions=False)
+
     # FIT MODEL
     elbo, q = mdl.fit(y,
                       method="laplace_em",
@@ -291,7 +370,17 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None):
 
     xhat = q.mean_continuous_states[0]
     zhat = mdl.most_likely_states(xhat, y)
-    
+
+    # ---- occupancy-revert (parity with the restricted fitters): if EM collapsed a
+    #      regime below the closed-form's occupied count, keep the closed-form fit.
+    if _wb_state is not None and K > 1:
+        _xb, _zb, _qb, _mb, _bocc = _wb_state
+        _emocc = np.bincount(np.asarray(zhat, dtype=int), minlength=K) / max(np.asarray(zhat).size, 1)
+        if int((_emocc >= 0.05).sum()) < int((_bocc >= 0.05).sum()):
+            print(f"[em-revert] unrestricted rSLDS K={K}: EM collapsed a regime "
+                  f"-> closed-form fit retained", flush=True)
+            return _xb, _zb, np.asarray([], dtype=float), _qb, _mb
+
     return xhat, zhat, elbo, q, mdl
 
 
@@ -519,8 +608,11 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
                              # consecutive-step relative changes oscillate at the few-percent
                              # level, while the running-best plateaus. cap = n_iter_em iterations;
                              # the highest-ELBO iterate is retained as a drift guard.
-    min_occupancy=0.05):     # per-regime usage floor; an EM run that drops the occupied-regime
+    min_occupancy=0.05,      # per-regime usage floor; an EM run that drops the occupied-regime
                              # count below the closed-form's is rejected in favour of that fit
+    transition_kind="recurrent_only"):  # "recurrent_only" -> rSLDS (StickyRecurrentOnly gate);
+                             # "standard" -> SLDS (StickyStandard fixed matrix). Same kappa, same
+                             # warm-up / EM / occupancy-revert: the ONLY difference is the gate form.
 
     """
     True rSLDS via ssm (Laplace EM + structured mean field):
@@ -600,18 +692,32 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         (C_mask is not None and np.any(np.asarray(C_mask) != 0)) or
         (d_mask is not None and np.any(np.asarray(d_mask) != 0)))
 
+    # ----- transition kind: rSLDS (recurrent gate) vs SLDS (fixed matrix), both
+    #       carrying the SAME Fox sticky kappa so a like-for-like rSLDS/SLDS
+    #       comparison isolates only the recurrent term R.x.
+    if transition_kind not in ("recurrent_only", "standard"):
+        raise ValueError("transition_kind must be 'recurrent_only' or 'standard', "
+                         f"got {transition_kind!r}")
+    _recurrent = (transition_kind == "recurrent_only")
+    _closed_form_fn    = fit_rSLDS_restricted if _recurrent else fit_SLDS_restricted
+    _trans_param_names = ("Rs", "r") if _recurrent else ("log_Ps",)
+
     # ----- model
     mdl = ssm.SLDS(
         N, K, D,
-        transitions="recurrent_only",       # placeholder; swapped to StickyRecurrentOnly below
+        transitions=("recurrent_only" if _recurrent else "standard"),  # placeholder; swapped below
         dynamics="diagonal_gaussian",
         emissions="gaussian",
         single_subspace=True,)
 
-    # Swap recurrent_only gate for the sticky variant: Linderman 2017
-    # recurrent_only gating + Fox 2011 fixed self-transition stickiness at
-    # _STICKY_KAPPA (see StickyRecurrentOnly).
-    mdl.transitions = StickyRecurrentOnly(K, D, M=0, kappa=_STICKY_KAPPA)
+    # Swap the gate for the sticky variant carrying kappa=_STICKY_KAPPA on BOTH
+    # classes (Fox 2011 stickiness):
+    #   recurrent_only -> StickyRecurrentOnly  (Linderman 2017 gate)
+    #   standard       -> StickyStandard       (fixed K x K matrix)
+    if _recurrent:
+        mdl.transitions = StickyRecurrentOnly(K, D, M=0, kappa=_STICKY_KAPPA)
+    else:
+        mdl.transitions = StickyStandard(K, D, M=0, kappa=_STICKY_KAPPA)
 
     # ----- emissions (fixed if C,d provided; else learned)
     fixed_emissions = (C is not None) and (d is not None)
@@ -766,26 +872,11 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     #      the fallback if EM diverges or collapses.
     base_state = None        # (xhat, zhat, q, mdl, occupancy) from the closed-form fit
     if warm_start and (C is not None) and (d is not None):
-        try:
-            x_base, z_base, _eb, q_base, base_mdl = fit_rSLDS_restricted(
-                y, params, C=C, d=d, n_iter_em=n_iter_em, seed=seed,
-                b_pattern=b_pattern, enforce_diag_A=enforce_diag_A,
-                C_mask=C_mask, d_mask=d_mask)
-            mdl.dynamics.As      = np.array(base_mdl.dynamics.As, dtype=float)
-            mdl.dynamics.bs      = np.array(base_mdl.dynamics.bs, dtype=float)
-            mdl.dynamics.sigmasq = np.maximum(np.array(base_mdl.dynamics.sigmasq, dtype=float), q_min)
-            mdl.transitions.Rs   = np.array(base_mdl.transitions.Rs, dtype=float)
-            mdl.transitions.r    = np.array(base_mdl.transitions.r, dtype=float)
-            mdl.emissions.Cs       = np.array(base_mdl.emissions.Cs, dtype=float)
-            mdl.emissions.ds       = np.array(base_mdl.emissions.ds, dtype=float)
-            mdl.emissions.inv_etas = np.array(base_mdl.emissions.inv_etas, dtype=float)
-            z_base = np.asarray(z_base, dtype=int)
-            base_occ = np.bincount(z_base, minlength=K) / max(z_base.size, 1)
-            base_state = (x_base, z_base, q_base, base_mdl, base_occ)
-        except Exception:
-            # closed-form warm start unavailable -> fall back to the cold init
-            # already set above; run full EM as before.
-            base_state = None
+        base_state = _closed_form_warmstart(
+            mdl, y, params, closed_form_fn=_closed_form_fn,
+            trans_param_names=_trans_param_names, C=C, d=d, n_iter_em=n_iter_em,
+            seed=seed, b_pattern=b_pattern, enforce_diag_A=enforce_diag_A,
+            C_mask=C_mask, d_mask=d_mask, q_min=q_min)
 
     # store µ for reporting (µ = b/(1-ρ))
     mdl.dynamics_mu_param = np.zeros((K, D))
@@ -954,17 +1045,20 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     # constraints; a high-ELBO-but-collapsed iterate is still caught by the
     # occupancy test below.
     def _snapshot():
-        return dict(
+        s = dict(
             As=np.array(mdl.dynamics.As), bs=np.array(mdl.dynamics.bs),
             sigmasq=np.array(mdl.dynamics.sigmasq),
-            Rs=np.array(mdl.transitions.Rs), r=np.array(mdl.transitions.r),
             Cs=np.array(mdl.emissions.Cs), ds=np.array(mdl.emissions.ds),
             inv_etas=np.array(mdl.emissions.inv_etas))
+        s["_trans"] = {nm: np.array(getattr(mdl.transitions, nm))
+                       for nm in _trans_param_names}
+        return s
 
     def _restore(s):
         mdl.dynamics.As = s["As"]; mdl.dynamics.bs = s["bs"]
         mdl.dynamics.sigmasq = s["sigmasq"]
-        mdl.transitions.Rs = s["Rs"]; mdl.transitions.r = s["r"]
+        for nm, v in s["_trans"].items():
+            setattr(mdl.transitions, nm, v)
         mdl.emissions.Cs = s["Cs"]; mdl.emissions.ds = s["ds"]
         mdl.emissions.inv_etas = s["inv_etas"]
 
@@ -1071,6 +1165,23 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         print(f"[em-accept] K={K} D={D} N={N}: EM fit accepted (occupancy guard passed)",
               flush=True)
     return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_use, mdl
+
+
+def fit_SLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
+        b_pattern=None, enforce_diag_A=True, q_min=1e-6, alpha_damp=0.5,
+        C_mask=None, d_mask=None, warm_start=True, em_tol=1e-3, min_occupancy=0.05):
+    """Restricted SLDS via the SAME warm-up + constrained Laplace-EM + occupancy-revert
+    pipeline as fit_rSLDS_restricted_em, carrying the SAME Fox sticky kappa
+    (_STICKY_KAPPA). The ONLY difference is the transition form: a fixed K x K matrix
+    (StickyStandard) instead of the recurrent gate (StickyRecurrentOnly). This is the
+    matched comparator for the T3 state-dependence test, so rSLDS - SLDS isolates
+    exactly the recurrent term R.x, with stickiness, warm-up, EM engine, guardrails
+    and occupancy-revert all held identical."""
+    return fit_rSLDS_restricted_em(
+        y, params, C=C, d=d, n_iter_em=n_iter_em, seed=seed, b_pattern=b_pattern,
+        enforce_diag_A=enforce_diag_A, q_min=q_min, alpha_damp=alpha_damp,
+        C_mask=C_mask, d_mask=d_mask, warm_start=warm_start, em_tol=em_tol,
+        min_occupancy=min_occupancy, transition_kind="standard")
 
 
 # ---------------------------------------------------------------
@@ -1462,6 +1573,17 @@ def fit_SLDS(y, params, n_iter_em=50, seed=None):
         mdl.emissions.inv_etas = np.maximum(mdl.emissions.inv_etas, _INV_ETAS_MIN)
     mdl.emissions.m_step = _emi_mstep_floored
 
+    # ---- shared warm-up (same as fit_rSLDS / the restricted fitters): closed-form
+    #      seed + occupancy-revert anchor; emissions relearned by the EM below.
+    _wb_state = None
+    if K > 1 and bool(params.get("single_subspace", True)):
+        _C0 = np.array(mdl.emissions.Cs[0], dtype=float)
+        _d0 = np.array(mdl.emissions.ds[0], dtype=float)
+        _wb_state = _closed_form_warmstart(
+            mdl, y, params, closed_form_fn=fit_SLDS_restricted,
+            trans_param_names=("log_Ps",), C=_C0, d=_d0,
+            n_iter_em=n_iter_em, seed=seed, copy_emissions=False)
+
     elbo, q = mdl.fit(y,
                       method="laplace_em",
                       variational_posterior="structured_meanfield",
@@ -1471,6 +1593,15 @@ def fit_SLDS(y, params, n_iter_em=50, seed=None):
 
     xhat = q.mean_continuous_states[0]
     zhat = mdl.most_likely_states(xhat, y)
+
+    # ---- occupancy-revert (parity with the restricted fitters).
+    if _wb_state is not None and K > 1:
+        _xb, _zb, _qb, _mb, _bocc = _wb_state
+        _emocc = np.bincount(np.asarray(zhat, dtype=int), minlength=K) / max(np.asarray(zhat).size, 1)
+        if int((_emocc >= 0.05).sum()) < int((_bocc >= 0.05).sum()):
+            print(f"[em-revert] unrestricted SLDS K={K}: EM collapsed a regime "
+                  f"-> closed-form fit retained", flush=True)
+            return _xb, _zb, np.asarray([], dtype=float), _qb, _mb
 
     return xhat, zhat, elbo, q, mdl
 
