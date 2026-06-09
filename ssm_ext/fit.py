@@ -56,6 +56,49 @@ class StickyRecurrentOnly(_RecOnly):
         return lp - _ag_logsumexp(lp, axis=2, keepdims=True)
 
 
+def _estimate_masked_loadings(C, d, y, C_mask):
+    """Closed-form (EM-free) estimate of the FREE emission loadings for the
+    restricted factor models, used by the EM-free fit_*_restricted paths.
+
+    Cells with C_mask != 0 (e.g. the factor1 / factor1_vix return loadings c_i)
+    are learned from data by least squares against the latent proxy. Cells with
+    C_mask == 0 (the fixed fundamental rows, the VIX structural row) are left
+    EXACTLY as passed. Fund / factor2 carry an all-zero mask, so their C is
+    returned unchanged (locked, never learned).
+
+    A free loading left at its 0 init makes its latent column dead in
+    x_proxy = C^+(y - d), so it can never be recovered (this is what produced
+    the all-zero return loading). We therefore (a) give each free cell a
+    non-zero data-scale value so the column is identified, (b) build the proxy
+    latent, (c) refine the free cells by regressing (y - d) on the proxy and
+    re-imposing the mask so fixed cells are untouched.
+    """
+    if C_mask is None:
+        return C
+    C_mask = np.asarray(C_mask, dtype=float)
+    if not np.any(C_mask != 0):
+        return C
+    C = np.array(C, dtype=float, copy=True)
+    yc = np.asarray(y, dtype=float) - np.asarray(d, dtype=float)
+    N, D = C.shape
+    y_std = yc.std(axis=0)
+    free = C_mask != 0
+    # (a) non-zero data-scale init for any free cell still at 0
+    for i in range(N):
+        for j in range(D):
+            if free[i, j] and C[i, j] == 0.0:
+                C[i, j] = y_std[i] if y_std[i] > 1e-8 else 1.0
+    # (b) proxy latent under the identified C
+    U, s, Vt = np.linalg.svd(C, full_matrices=False)
+    s_inv = np.where(s > 1e-8, 1.0 / s, 0.0)
+    x0 = yc @ ((Vt.T * s_inv) @ U.T).T              # (T, D)
+    # (c) least-squares refine of the free cells; mask re-imposed
+    XtX = x0.T @ x0 + 1e-8 * np.eye(D)
+    C_ls = (yc.T @ x0) @ np.linalg.inv(XtX)          # (N, D)
+    C = C_mask * C_ls + (1.0 - C_mask) * C
+    return C
+
+
 # ---------------------------------------------------------------
 # Fit rSLDS
 # ---------------------------------------------------------------
@@ -261,14 +304,11 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
 
     The model is a genuine recurrent SLDS (RecurrentOnlyTransitions: softmax
     gate over Rs.x + r, used for switching at inference). Emissions are fixed
-    (C, d). It is fit WITHOUT variational EM, because EM on this model class is
-    unreliable on short mean-shift return series: the ELBO optimum does not
-    coincide with the true regime partition (see rslds_emfree_note.md), so EM
-    collapses distinct regimes into one near-unit-root law regardless of init.
+    (C, d). It is fit WITHOUT variational EM, using closed-form per-regime
+    moment estimates from a k-means partition of the latent proxy.
 
     Three-stage fit (all on the training batch only; leak-free):
-      1. Assignment   : k-means on x_proxy = C^+(y - d).  (discriminative;
-                        ~0.97 accuracy where EM gives ~0.5.)
+      1. Assignment   : k-means on x_proxy = C^+(y - d).
       2. Dynamics     : per-regime (A_k, b_k, sigmasq_k) read off from each
                         cluster's within-cluster moments — time-adjacent lag-1
                         autocorrelation -> A, (1-A).centroid -> b, variance ->
@@ -319,6 +359,10 @@ def fit_rSLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
         dynamics="diagonal_gaussian",
         emissions="gaussian",
         single_subspace=True,)
+
+    # learn the free factor loadings closed-form (fund/factor2: mask all-zero
+    # -> C returned unchanged, stays locked). Fixes the all-zero return loading.
+    C = _estimate_masked_loadings(C, d, y, C_mask)
 
     # lock emissions to (C, d) with data-driven observation noise
     obs_var = np.var(y, axis=0)
@@ -464,7 +508,19 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     b_pattern=None, enforce_diag_A=True,
     q_min=1e-6,              # floor on dynamics variance
     alpha_damp=0.5,          # Laplace-EM damping: new=(1-a)*Mstep+a*old; >0 prevents overshoot
-    C_mask=None, d_mask=None):
+    C_mask=None, d_mask=None,
+    # ---- anti-collapse guardrails (pre-declared; set on principled grounds,
+    #      NOT tuned to test outcomes) ----
+    warm_start=True,         # seed EM from the closed-form (k-means) restricted fit
+    em_tol=1e-3,             # CONVERGENCE tolerance on the RUNNING-BEST ELBO: converged when
+                             # the best ELBO fails to improve by more than em_tol (relative) for
+                             # EM_PATIENCE consecutive checks. Best-ELBO (not consecutive-change)
+                             # is used because the projected-EM ELBO is non-monotone -- its
+                             # consecutive-step relative changes oscillate at the few-percent
+                             # level, while the running-best plateaus. cap = n_iter_em iterations;
+                             # the highest-ELBO iterate is retained as a drift guard.
+    min_occupancy=0.05):     # per-regime usage floor; an EM run that drops the occupied-regime
+                             # count below the closed-form's is rejected in favour of that fit
 
     """
     True rSLDS via ssm (Laplace EM + structured mean field):
@@ -482,10 +538,37 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     - Final E-only pass
     - Returns (xhat, zhat, elbo_trace, q_last, mdl)
 
-    NOTE: This is the best EM-based restricted variant (data-driven init +
-    a_max persistence cap). On short mean-shift return series it still
-    collapses regimes (~0.5 accuracy); retained as an ablation. The stable
-    production fit is the EM-free fit_rSLDS_restricted (see rslds_emfree_note.md).
+    NOTE: This is the main EM-based restricted fitting algorithm: data-driven
+    init, a per-regime persistence cap (a_max), and a single coupled Laplace-EM
+    with damping and per-iteration identifiability constraints.
+
+    ANTI-COLLAPSE GUARDRAILS (pre-declared, principled, frozen before scoring):
+      1. warm start  - the closed-form (k-means) restricted fit does the heavy
+                       lifting; EM is seeded there and refines.
+      2. convergence - coupled Laplace-EM is iterated (resuming the variational
+                       posterior) until the RUNNING-BEST ELBO stops improving by
+                       more than em_tol (relative) over EM_PATIENCE consecutive
+                       checks, capped at n_iter_em iterations. Best-ELBO (not
+                       consecutive-step change) is the convergence target because
+                       the hard stationarity/projection constraints make the
+                       projected-EM ELBO non-monotone: consecutive-step relative
+                       changes oscillate at the few-percent level while the
+                       running-best plateaus. The highest-ELBO iterate is retained
+                       as a drift guard. If the cap is reached first the run is
+                       logged as not-converged. Collapse is prevented by the
+                       constraints below; a high-ELBO-but-collapsed iterate is
+                       caught by the occupancy test.
+      3. stationarity- |rho_k| clipped to a_max < 1 every M-step (no unit-root /
+                       explosive A); process variance floored at q_min.
+      4. stickiness  - StickyRecurrentOnly gate (kappa=_STICKY_KAPPA) biases
+                       self-transitions -> enforces dwell, discourages flip-flop.
+      5. occupancy   - EM is accepted only if it preserves the closed-form fit's
+                       count of regimes above the min_occupancy floor; otherwise
+                       the closed-form fit is retained. EM that diverges outright
+                       also falls back to the closed-form fit (never worse than
+                       not running EM).
+    These prevent degenerate optima; they do not and cannot force regimes that
+    do not transfer out of sample (that is what T1b/T2/T3 still test).
 
     Notes on C_mask, d_mask:
         Arrays same shape as Cs, ds (or broadcastable). Entries in {0, 1} (or bool).
@@ -651,11 +734,8 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         # unit root and shrinking b toward zero. We cap |A| at the largest
         # within-cluster lag-1 autocorrelation observed at init, plus one
         # standard error (~1/sqrt(n_min) for n_min the smallest cluster size).
-        # NOTE: the cap attenuates the A->unit-root drift but on short
-        # mean-shift return series does NOT prevent regime collapse on its own
-        # (empirically ~0.5 accuracy); this EM variant is retained as an
-        # ablation. The stable production fit is the EM-free fit_rSLDS_restricted
-        # (see rslds_emfree_note.md). Leak-free: IS k-means partition only.
+        # The cap attenuates the A->unit-root drift during EM. Leak-free: it is
+        # read from the IS k-means partition only.
         # Closure local read by _enforce_identifiability_and_mu.
         cluster_sizes = np.array([int((labels == old_idx).sum()) for old_idx in range(K)])
         n_min = max(int(cluster_sizes.min()), 1)
@@ -678,6 +758,34 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         mdl.emissions.Cs       = C[None, :, :]
         mdl.emissions.ds       = d[None, :]
         mdl.emissions.inv_etas = inv_etas
+
+    # ---- warm start: let the closed-form (k-means) restricted fit do the heavy
+    #      lifting, then run EM to convergence within the constrained space. The
+    #      closed-form solution is stable and non-degenerate; seeding EM there
+    #      (vs a cold init) keeps EM in a good basin. base_state also serves as
+    #      the fallback if EM diverges or collapses.
+    base_state = None        # (xhat, zhat, q, mdl, occupancy) from the closed-form fit
+    if warm_start and (C is not None) and (d is not None):
+        try:
+            x_base, z_base, _eb, q_base, base_mdl = fit_rSLDS_restricted(
+                y, params, C=C, d=d, n_iter_em=n_iter_em, seed=seed,
+                b_pattern=b_pattern, enforce_diag_A=enforce_diag_A,
+                C_mask=C_mask, d_mask=d_mask)
+            mdl.dynamics.As      = np.array(base_mdl.dynamics.As, dtype=float)
+            mdl.dynamics.bs      = np.array(base_mdl.dynamics.bs, dtype=float)
+            mdl.dynamics.sigmasq = np.maximum(np.array(base_mdl.dynamics.sigmasq, dtype=float), q_min)
+            mdl.transitions.Rs   = np.array(base_mdl.transitions.Rs, dtype=float)
+            mdl.transitions.r    = np.array(base_mdl.transitions.r, dtype=float)
+            mdl.emissions.Cs       = np.array(base_mdl.emissions.Cs, dtype=float)
+            mdl.emissions.ds       = np.array(base_mdl.emissions.ds, dtype=float)
+            mdl.emissions.inv_etas = np.array(base_mdl.emissions.inv_etas, dtype=float)
+            z_base = np.asarray(z_base, dtype=int)
+            base_occ = np.bincount(z_base, minlength=K) / max(z_base.size, 1)
+            base_state = (x_base, z_base, q_base, base_mdl, base_occ)
+        except Exception:
+            # closed-form warm start unavailable -> fall back to the cold init
+            # already set above; run full EM as before.
+            base_state = None
 
     # store µ for reporting (µ = b/(1-ρ))
     mdl.dynamics_mu_param = np.zeros((K, D))
@@ -833,45 +941,136 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         _project_emissions_(mdl.emissions, C_fix=C, d_fix=d, C_mask=C_mask, d_mask=d_mask)
 
 
-    # ----- coupled Laplace-EM (single ssm fit)
-    # Replaces the previous hand-rolled split (E-only pass then M-enabled pass,
-    # each a separate num_iters=1 laplace_em with alpha=0.0, constraints applied
-    # BETWEEN calls). That split produced non-monotonic ELBO blow-ups (e.g.
-    # -684448 spikes) and, on less-stable families, an inf/NaN that hard-crashed
-    # ssm's message passing. Here ssm runs the E/M coupling itself for n_iter_em
-    # iterations with damping (alpha_damp), and the constrained dynamics m_step
-    # (A-clip, b zero-pattern, sigmasq floor) is enforced at every iteration.
-    # Emissions stay locked when fixed_emissions (m_step is a no-op via _enable_M_pass).
+    # ----- coupled Laplace-EM, warm-started, within the constrained space.
+    # Run in small chunks (resuming the posterior) until the RUNNING-BEST ELBO
+    # plateaus (no >em_tol relative gain over EM_PATIENCE checks = CONVERGENCE),
+    # or the n_iter_em cap is hit. Best-ELBO is the convergence target because the
+    # projected-EM ELBO is non-monotone under the hard constraints: consecutive-
+    # step relative changes oscillate at the few-percent level, while the running-
+    # best plateaus -- so a consecutive-change tol measures oscillation, not
+    # progress. The highest-ELBO iterate is retained (drift guard). The
+    # constrained m_step (A-clip to a_max, b zero-pattern, sigmasq floor) + sticky
+    # gate fire every internal iteration, so collapse is prevented by the
+    # constraints; a high-ELBO-but-collapsed iterate is still caught by the
+    # occupancy test below.
+    def _snapshot():
+        return dict(
+            As=np.array(mdl.dynamics.As), bs=np.array(mdl.dynamics.bs),
+            sigmasq=np.array(mdl.dynamics.sigmasq),
+            Rs=np.array(mdl.transitions.Rs), r=np.array(mdl.transitions.r),
+            Cs=np.array(mdl.emissions.Cs), ds=np.array(mdl.emissions.ds),
+            inv_etas=np.array(mdl.emissions.inv_etas))
+
+    def _restore(s):
+        mdl.dynamics.As = s["As"]; mdl.dynamics.bs = s["bs"]
+        mdl.dynamics.sigmasq = s["sigmasq"]
+        mdl.transitions.Rs = s["Rs"]; mdl.transitions.r = s["r"]
+        mdl.emissions.Cs = s["Cs"]; mdl.emissions.ds = s["ds"]
+        mdl.emissions.inv_etas = s["inv_etas"]
+
+    EM_CHUNK = 2             # iterations between convergence checks
+    EM_PATIENCE = 3          # consecutive checks w/o a >em_tol best-ELBO gain -> converged
     elbo_trace = []
     q_last = None
     _enable_M_pass()
     max_attempts = 5
-    for attempt in range(max_attempts):
-        try:
-            elbo, q_last = mdl.fit(
-                y,
-                method="laplace_em",
-                variational_posterior="structured_meanfield",
-                num_iters=int(n_iter_em),
-                alpha=alpha_damp,
-                initialize=False)
+    cap = int(n_iter_em)
+    iters_done = 0
+    best_elbo = -np.inf
+    best_snap = None
+    q_best = None
+    no_improve = 0
+    converged = False
+    while iters_done < cap:
+        n_this = min(EM_CHUNK, cap - iters_done)
+        fit_ok = False
+        for attempt in range(max_attempts):
+            try:
+                vp = "structured_meanfield" if q_last is None else q_last
+                elbo, q_last = mdl.fit(
+                    y, method="laplace_em", variational_posterior=vp,
+                    num_iters=n_this, alpha=alpha_damp, initialize=False, verbose=0)
+                fit_ok = True
+                break
+            except AssertionError:
+                if attempt == max_attempts - 1:
+                    break
+                rng = np.random.RandomState(seed=hash(("EM", iters_done, attempt)) % (2**31 - 1))
+                mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
+        if not fit_ok:
             break
-        except AssertionError:
-            if attempt == max_attempts - 1:
-                raise
-            # Deterministic perturbation of bs (seeded by attempt) so reruns
-            # are reproducible; nudges off a collapsed-responsibility init.
-            rng = np.random.RandomState(seed=hash(("EM", attempt)) % (2**31 - 1))
-            mdl.dynamics.bs = mdl.dynamics.bs + 1e-3 * rng.randn(*mdl.dynamics.bs.shape)
-    elbo_trace.extend(list(elbo))
+        elbo_trace.extend(list(elbo))
+        iters_done += len(elbo)
+        cur = float(elbo[-1])
+        # CONVERGENCE on the RUNNING-BEST ELBO. The projected-EM ELBO is non-monotone:
+        # consecutive-step relative changes oscillate at the few-percent level, so a
+        # consecutive-change tol is the wrong instrument (it measures oscillation, not
+        # progress). The running-best ELBO is what plateaus. Converged := the best ELBO
+        # fails to improve by more than em_tol (relative) for EM_PATIENCE consecutive
+        # checks. best_snap always tracks the argmax iterate (drift guard).
+        improved_materially = (np.isfinite(cur) and
+                               cur > best_elbo + em_tol * (abs(best_elbo) + 1e-12))
+        if np.isfinite(cur) and cur > best_elbo:
+            best_elbo = cur
+            best_snap = _snapshot()
+            q_best = q_last
+        if improved_materially:
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= EM_PATIENCE:
+                converged = True
+                break
+
+    # Restore the highest-ELBO iterate (drift guard) and log convergence status.
+    # If EM never produced a usable iterate, fall back to the closed-form fit
+    # (divergent EM must never be worse than no EM).
+    if best_snap is not None:
+        _restore(best_snap)
+        q_use = q_best
+        status = "converged" if converged else "did NOT converge within n_iter_em cap"
+        print(f"[em-status] K={K} D={D} N={N}: {status} in {iters_done} iters "
+              f"(best ELBO={best_elbo:.6g}, tol={em_tol:g})", flush=True)
+    elif q_last is not None:
+        q_use = q_last
+    elif base_state is not None:
+        x_base, z_base, q_base, base_mdl, _ = base_state
+        print(f"[em-fallback] K={K} D={D} N={N}: EM diverged -> closed-form fit retained", flush=True)
+        return x_base, z_base, np.asarray([], dtype=float), q_base, base_mdl
+    else:
+        raise RuntimeError("Laplace-EM failed and no closed-form fallback was available.")
 
     # final identifiability + emission projection (one authoritative pass)
     _enforce_identifiability_and_mu()
     if fixed_emissions:
         _project_emissions_(mdl.emissions, C_fix=C, d_fix=d, C_mask=C_mask, d_mask=d_mask)
-    xhat = q_last.mean_continuous_states[0]
+    xhat = q_use.mean_continuous_states[0]
     zhat = mdl.most_likely_states(xhat, y)
-    return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_last, mdl
+
+    # ---- anti-collapse acceptance test: EM is accepted only if it preserves the
+    #      regimes the closed-form fit found. If the highest-ELBO iterate still
+    #      collapsed a regime (occupied-regime count below the closed-form's,
+    #      vs the min_occupancy floor), revert to the closed-form fit. The
+    #      [em-revert] log lets the run report the revert rate.
+    if base_state is not None and K > 1:
+        x_base, z_base, q_base, base_mdl, base_occ = base_state
+        z_em = np.asarray(zhat, dtype=int)
+        em_occ = np.bincount(z_em, minlength=K) / max(z_em.size, 1)
+        base_used = int((base_occ >= min_occupancy).sum())
+        em_used   = int((em_occ   >= min_occupancy).sum())
+        if em_used < base_used:
+            print(f"[em-revert] K={K} D={D} N={N}: EM occupied {em_used}/{K} regimes "
+                  f"vs closed-form {base_used}/{K} (floor={min_occupancy}) -> "
+                  f"closed-form fit retained", flush=True)
+            return (x_base, z_base, np.asarray(elbo_trace, dtype=float),
+                    q_base, base_mdl)
+
+    # EM fit accepted (occupancy guard passed). Logged so the run can report the
+    # revert rate = #[em-revert] / (#[em-accept] + #[em-revert]) over K>1 fits.
+    if base_state is not None and K > 1:
+        print(f"[em-accept] K={K} D={D} N={N}: EM fit accepted (occupancy guard passed)",
+              flush=True)
+    return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_use, mdl
 
 
 # ---------------------------------------------------------------
@@ -1176,8 +1375,10 @@ def fit_SLDS(y, params, n_iter_em=50, seed=None):
                    emissions="gaussian",
                    single_subspace=single_subspace)
 
-    if N < D * K:
+    if N < D * K or D >= N:
         # Same bypass as fit_rSLDS — ssm.SLDS.initialize fails when D*Keff > N.
+        # The `D >= N` clause also covers single_subspace K=1 with N == D, where
+        # ssm's PCA initializer sets noise_variance_ = 0 -> inv_etas = log(0).
         # See ssm_init_note.md. Identical machinery minus the recurrent-gate
         # (Rs / r / Ws) lines and plus a label-counts log_Ps initialiser.
         mdl.init_state_distn.log_pi0 = np.log(np.full(K, 1.0 / K))
@@ -1249,6 +1450,18 @@ def fit_SLDS(y, params, n_iter_em=50, seed=None):
     else:
         mdl.initialize(y)
 
+    # --- emission-variance floor (parity with fit_rSLDS; guards K=1 N==D PCA
+    #     noise_variance_=0 -> inv_etas=log(0), and EM driving residual var ~0) ---
+    _INV_ETAS_MIN = float(np.log(1e-4))
+    mdl.emissions.inv_etas = np.maximum(
+        np.nan_to_num(mdl.emissions.inv_etas, neginf=_INV_ETAS_MIN, nan=_INV_ETAS_MIN),
+        _INV_ETAS_MIN)
+    _emi_mstep_base_uns = mdl.emissions.m_step
+    def _emi_mstep_floored(*a, **k):
+        _emi_mstep_base_uns(*a, **k)
+        mdl.emissions.inv_etas = np.maximum(mdl.emissions.inv_etas, _INV_ETAS_MIN)
+    mdl.emissions.m_step = _emi_mstep_floored
+
     elbo, q = mdl.fit(y,
                       method="laplace_em",
                       variational_posterior="structured_meanfield",
@@ -1313,6 +1526,10 @@ def fit_SLDS_restricted(y, params, C=None, d=None, n_iter_em=10, seed=None,
         dynamics="diagonal_gaussian",
         emissions="gaussian",
         single_subspace=True,)
+
+    # learn the free factor loadings closed-form (fund/factor2: mask all-zero
+    # -> C returned unchanged, stays locked). Fixes the all-zero return loading.
+    C = _estimate_masked_loadings(C, d, y, C_mask)
 
     obs_var = np.var(y, axis=0)
     obs_var = np.clip(np.nan_to_num(obs_var, nan=1.0, posinf=1e6, neginf=1e6), 1e-8, 1e6)

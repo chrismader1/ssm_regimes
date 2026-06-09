@@ -570,12 +570,44 @@ def causal_cpll_SLDS(mdl, y, T_split):
     def _erow(arr, k):
         return arr[0] if arr.shape[0] == 1 else arr[k]
 
+    # --- numerical guards (identical to causal_cpll_rSLDS, so the rSLDS-vs-SLDS
+    #     T3 gap is finite and on the same footing for divergent fits) ---
+    P_CEIL = 1e10
+    P_FLOOR = 1e-12
+    JIT0 = 1e-9
+    LOG2PI = np.log(2.0 * np.pi)
+    eyeN = np.eye(N)
+
+    def _safe_mvn_logpdf(x, mean, cov):
+        S = 0.5 * (cov + cov.T)
+        scale = max(1.0, np.trace(S) / max(N, 1))
+        jit = JIT0 * scale
+        L = None
+        for _ in range(8):
+            try:
+                L = np.linalg.cholesky(S + jit * eyeN)
+                break
+            except np.linalg.LinAlgError:
+                jit *= 10.0
+        if L is None:
+            return -1e12
+        diff = x - mean
+        z = np.linalg.solve(L, diff)
+        logdet = 2.0 * np.sum(np.log(np.diag(L)))
+        return -0.5 * (N * LOG2PI + logdet + float(z @ z))
+
+    def _cap_cov(P):
+        P = 0.5 * (P + P.T)
+        ev, V = np.linalg.eigh(P)
+        ev = np.clip(ev, P_FLOOR, P_CEIL)
+        return (V * ev) @ V.T
+
     # init belief over x_0 from y_0 via the shared/first emission row
     C0 = Cs[0]; d0 = ds[0]
     R0 = np.diag(np.exp(-invE[0]))
     Cpinv = np.linalg.pinv(C0)
     m = Cpinv @ (y[0] - d0)
-    P = Cpinv @ R0 @ Cpinv.T + 1e-6 * np.eye(D)
+    P = _cap_cov(Cpinv @ R0 @ Cpinv.T + 1e-6 * np.eye(D))
 
     log_bz = log_pi0.copy()   # filtered belief over z_0
 
@@ -593,15 +625,17 @@ def causal_cpll_SLDS(mdl, y, T_split):
         for k in range(K):
             mpk = As[k] @ m + bs[k]
             Ppk = As[k] @ P @ As[k].T + np.diag(Qd[k])
+            Ppk = 0.5 * (Ppk + Ppk.T)
             Ck = _erow(Cs, k); dk = _erow(ds, k)
             Rk = np.diag(np.exp(-_erow(invE, k)))
             yhat = Ck @ mpk + dk
             S = Ck @ Ppk @ Ck.T + Rk
-            comp_ll[k] = _mvn_logpdf(y[t], yhat, S)
-            Sinv = np.linalg.inv(0.5 * (S + S.T) + 1e-10 * np.eye(N))
-            Kg = Ppk @ Ck.T @ Sinv
+            comp_ll[k] = _safe_mvn_logpdf(y[t], yhat, S)
+            Ssym = 0.5 * (S + S.T) + 1e-10 * eyeN
+            Kg = np.linalg.solve(Ssym, Ck @ Ppk).T          # (D, N)
             m_upd[k] = mpk + Kg @ (y[t] - yhat)
-            P_upd[k] = (eyeD - Kg @ Ck) @ Ppk
+            Pk = (eyeD - Kg @ Ck) @ Ppk
+            P_upd[k] = 0.5 * (Pk + Pk.T)
 
         joint = log_bz_pred + comp_ll
         denom = logsumexp(joint)
@@ -616,7 +650,8 @@ def causal_cpll_SLDS(mdl, y, T_split):
         for k in range(K):
             dmk = (m_upd[k] - m_new)[:, None]
             P_new += w[k] * (P_upd[k] + dmk @ dmk.T)
-        m, P = m_new, P_new
+        P = _cap_cov(P_new)
+        m = m_new
 
     return cpll, cpll_oos
 
