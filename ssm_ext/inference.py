@@ -157,21 +157,52 @@ def inference_rSLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False):
             "max_cpll": float(max_cpll), "mdl": mdl}
 
 
-def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
+def causal_cpll_rSLDS(mdl, y, T_split):
     """
-    Shared causal one-step predictive log-likelihood core (GPB1 switching Kalman
-    filter) for the diagonal-Gaussian-dynamics, Gaussian-emission SLDS family in
-    fit.py. Both causal_cpll_rSLDS and causal_cpll_SLDS call this with the SAME
-    numerics -- bounded dynamics-based P0 prior, jittered-Cholesky
-    _safe_mvn_logpdf, eigenvalue-capped GPB1 collapse -- and differ ONLY in
-    `transition_logpz(m, log_bz) -> log p(z_t | .)` (already renormalized):
-        rSLDS (recurrent_only): softmax(Rs @ m + r)        gate at filtered x-mean
-        SLDS  (standard)      : softmax(logsumexp(log_bz + log_Ps))  Markov on z
-    Sharing the core guarantees cpll_oos(rSLDS) - cpll_oos(SLDS) reflects the
-    transition mechanism alone, not an implementation-numerics asymmetry.
+    Causal one-step predictive log-likelihood for the recurrent-only,
+    diagonal-Gaussian-dynamics, Gaussian-emission SLDS built in fit.py
+    (transitions='recurrent_only', dynamics='diagonal_gaussian',
+    emissions='gaussian'). Look-ahead-free GPB1 switching filter: the
+    predictive density of y_t uses only data up to t-1.
 
-    Returns (cpll, cpll_oos), summed over t = 1..T-1 and t >= T_split.
-    Same units/scale as inference_HMM / inference_ARHMM cpll.
+    Returns (cpll, cpll_oos), summed over t = 1 .. T-1 and t = T_split .. T-1.
+    Same units/scale as inference_HMM / inference_ARHMM cpll (observation-space
+    one-step predictive log density of y_t).
+
+    -------------------------------------------------------------------------
+    NUMERICAL REDESIGN (vs. the original) — what changed and why
+    -------------------------------------------------------------------------
+    The original blew up to +/-50..320 nats for free-C / identity-C fits while
+    staying sane for structured (factor1_vix) C. Root causes and fixes:
+
+    1. INIT.  Original: P0 = pinv(C0) @ R0 @ pinv(C0).T. For an ill-conditioned
+       or wide C0 (free / identity emissions) pinv(C0) is huge, so P0 — and
+       hence the predictive covariance S = C P C' + R — explodes from t=0.
+       For structured C0 it happened to be fine, which is the family split.
+       Fix: P0 is a BOUNDED, dynamics-based prior — the per-latent stationary
+       variance Qd/(1-rho^2) (clipped for |rho|>=1), taken as the median over
+       regimes. This is principled (it is the model's own stationary spread)
+       and cannot be inflated by a poorly-conditioned emission. The latent mean
+       is still seeded from y_0 by least squares, but with an explicit rcond so
+       a near-singular C0 cannot send m0 to infinity.
+
+    2. PREDICTIVE DENSITY.  Robust Cholesky with adaptive jitter and a log-det
+       from the Cholesky factor — no explicit inverse, no NaN/Inf from a
+       singular S. A genuinely huge S still yields a correctly very-negative
+       log density (honest: that fit really did predict badly).
+
+    3. KALMAN UPDATE.  Gain via solve(), not inv(); covariances symmetrized.
+
+    4. OVERFLOW GUARD ONLY.  The collapsed P has its eigenvalues capped at a
+       large finite ceiling (P_CEIL). This is NOT a fit rescue and NOT result
+       flattering: it engages only once the variance is already astronomically
+       large (a divergent fit), and merely keeps the score a large-but-finite
+       very-negative number instead of Inf/NaN that would poison the sum. A
+       model that diverges still scores as badly as it should.
+
+    The structured (factor1_vix) family — already stable — is unchanged by
+    these guards (its P never approaches the ceiling, its S is well-conditioned);
+    the guards only stop the free/identity families from returning garbage.
     """
     y = np.asarray(y, dtype=float)
     if y.ndim == 1:
@@ -183,17 +214,11 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
     As   = np.asarray(mdl.dynamics.As, dtype=float)        # (K, D, D)
     bs   = np.asarray(mdl.dynamics.bs, dtype=float)        # (K, D)
     Qd   = np.clip(np.asarray(mdl.dynamics.sigmasq, dtype=float), 1e-12, None)  # (K, D)
+    Rs   = np.asarray(mdl.transitions.Rs, dtype=float)     # (K, D)
+    rvec = np.asarray(mdl.transitions.r, dtype=float)      # (K,)
     Cs   = np.asarray(mdl.emissions.Cs, dtype=float)       # (Kc, N, D)
     ds   = np.asarray(mdl.emissions.ds, dtype=float)       # (Kc, N)
     invE = np.asarray(mdl.emissions.inv_etas, dtype=float) # (Ke, N)
-
-    # initial regime belief: used by the Markov (SLDS) transition; the recurrent
-    # (rSLDS) transition ignores it, so tracking it leaves rSLDS scores unchanged.
-    try:
-        log_bz = np.asarray(mdl.init_state_distn.log_pi0, dtype=float)
-        log_bz = log_bz - logsumexp(log_bz)
-    except Exception:
-        log_bz = np.full(K, -np.log(max(K, 1)))
 
     def _erow(arr, k):
         arr = np.asarray(arr)
@@ -201,7 +226,7 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
             return arr
         return arr[0] if arr.shape[0] == 1 else arr[k]
 
-    # ---- numerical constants (identical for both transition mechanisms) ----
+    # ---- numerical constants ----
     P_CEIL = 1e10          # overflow guard on latent-covariance eigenvalues
     P_FLOOR = 1e-12        # keep covariances strictly PD
     JIT0   = 1e-9          # base jitter for the predictive covariance
@@ -225,7 +250,7 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
         if L is None:
             return -1e12  # fully degenerate; honest floor, finite
         diff = x - mean
-        z = np.linalg.solve(L, diff)
+        z = np.linalg.solve(L, diff)              # L z = diff  -> z = L^{-1} diff
         logdet = 2.0 * np.sum(np.log(np.diag(L)))
         return -0.5 * (N * LOG2PI + logdet + float(z @ z))
 
@@ -250,7 +275,9 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
     cpll = 0.0
     cpll_oos = 0.0
     for t in range(1, T):
-        log_pz = transition_logpz(m, log_bz)              # renormalized predictive p(z_t)
+        # gate at the filtered mean (point approximation; gate nonlinear in x)
+        log_pz = Rs @ m + rvec
+        log_pz = log_pz - logsumexp(log_pz)
 
         comp_ll = np.empty(K)
         m_upd = np.empty((K, D))
@@ -265,6 +292,7 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
             yhat = Ck @ mpk + dk
             S = Ck @ Ppk @ Ck.T + Rk
             comp_ll[k] = _safe_mvn_logpdf(y[t], yhat, S)
+            # Kalman gain Kg = Ppk Ck^T S^{-1}, via solve on the symmetrized S
             Ssym = 0.5 * (S + S.T) + 1e-10 * eyeN
             Kg = np.linalg.solve(Ssym, Ck @ Ppk).T          # (D, N)
             m_upd[k] = mpk + Kg @ (y[t] - yhat)
@@ -278,7 +306,6 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
             cpll_oos += float(denom)
 
         w = np.exp(joint - denom)
-        log_bz = joint - denom                             # filtered z-belief (Markov gate)
         m_new = np.sum(w[:, None] * m_upd, axis=0)
         P_new = np.zeros((D, D))
         for k in range(K):
@@ -288,30 +315,6 @@ def _causal_cpll_gpb1(mdl, y, T_split, *, transition_logpz):
         m = m_new
 
     return cpll, cpll_oos
-
-
-def causal_cpll_rSLDS(mdl, y, T_split):
-    """
-    Causal one-step predictive log-likelihood for the recurrent-only SLDS
-    (transitions='recurrent_only'). Thin wrapper over the shared GPB1 core
-    (_causal_cpll_gpb1); the predictive regime distribution is the recurrent
-    gate evaluated at the filtered latent mean, softmax(Rs @ m + r). Returns
-    (cpll, cpll_oos), summed over t = 1..T-1 and t >= T_split.
-    Same units/scale as inference_HMM / inference_ARHMM.
-
-    NOTE: the gate is a point approximation at the filtered mean (the gate is
-    nonlinear in x); the recurrent transition has no z_{t-1} dependence, so the
-    carried z-belief is unused on this path.
-    """
-    Rs   = np.asarray(mdl.transitions.Rs, dtype=float)     # (K, D)
-    rvec = np.asarray(mdl.transitions.r, dtype=float)      # (K,)
-
-    def _transition_logpz(m, log_bz):
-        lp = Rs @ m + rvec
-        return lp - logsumexp(lp)
-
-    return _causal_cpll_gpb1(mdl, y, T_split, transition_logpz=_transition_logpz)
-
 
 
 def inference_HMM(px, mdl, y, T_split, dt=1/252, display=False):
@@ -543,23 +546,79 @@ def filter_states_causal(y, mdl, model_type, pi0):
 
 def causal_cpll_SLDS(mdl, y, T_split):
     """
-    Causal one-step predictive log-likelihood for the standard SLDS
-    (transitions='standard'). Thin wrapper over the shared GPB1 core
-    (_causal_cpll_gpb1): identical P0 prior, predictive density and covariance
-    handling as causal_cpll_rSLDS, differing ONLY in the transition predictive
-    term -- here the Markov chain on z, softmax(logsumexp(log_bz + log_Ps)).
-    Sharing the core makes cpll_oos directly comparable to the recurrent path,
-    so the T3 state-dependence gap isolates the transition mechanism rather than
-    an implementation-numerics asymmetry. Returns (cpll, cpll_oos).
+    transitions='standard', dynamics='diagonal_gaussian', emissions='gaussian'.
+    Returns (cpll, cpll_oos): cpll = sum_{t=1..T-1} log p(y_t | y_{0:t-1});
+    cpll_oos = the same sum restricted to t >= T_split.
     """
+    y = np.asarray(y, dtype=float)
+    if y.ndim == 1:
+        y = y[:, None]
+    T, N = y.shape
+    K = int(mdl.K)
+    D = int(mdl.D)
+
+    As     = np.asarray(mdl.dynamics.As, dtype=float)          # (K, D, D)
+    bs     = np.asarray(mdl.dynamics.bs, dtype=float)          # (K, D)
+    Qd     = np.clip(np.asarray(mdl.dynamics.sigmasq, dtype=float), 1e-12, None)
     log_Ps = np.asarray(mdl.transitions.log_Ps, dtype=float)   # (K, K)
+    Cs     = np.asarray(mdl.emissions.Cs, dtype=float)
+    ds     = np.asarray(mdl.emissions.ds, dtype=float)
+    invE   = np.asarray(mdl.emissions.inv_etas, dtype=float)
+    log_pi0 = np.asarray(mdl.init_state_distn.log_pi0, dtype=float)
+    log_pi0 = log_pi0 - logsumexp(log_pi0)
 
-    def _transition_logpz(m, log_bz):
-        lp = logsumexp(log_bz[:, None] + log_Ps, axis=0)
-        return lp - logsumexp(lp)
+    def _erow(arr, k):
+        return arr[0] if arr.shape[0] == 1 else arr[k]
 
-    return _causal_cpll_gpb1(mdl, y, T_split, transition_logpz=_transition_logpz)
+    # init belief over x_0 from y_0 via the shared/first emission row
+    C0 = Cs[0]; d0 = ds[0]
+    R0 = np.diag(np.exp(-invE[0]))
+    Cpinv = np.linalg.pinv(C0)
+    m = Cpinv @ (y[0] - d0)
+    P = Cpinv @ R0 @ Cpinv.T + 1e-6 * np.eye(D)
 
+    log_bz = log_pi0.copy()   # filtered belief over z_0
+
+    eyeD = np.eye(D)
+    cpll = 0.0
+    cpll_oos = 0.0
+    for t in range(1, T):
+        # propagate z-belief through the Markov chain (no x-dependence)
+        log_bz_pred = logsumexp(log_bz[:, None] + log_Ps, axis=0)
+        log_bz_pred = log_bz_pred - logsumexp(log_bz_pred)
+
+        comp_ll = np.empty(K)
+        m_upd = np.empty((K, D))
+        P_upd = np.empty((K, D, D))
+        for k in range(K):
+            mpk = As[k] @ m + bs[k]
+            Ppk = As[k] @ P @ As[k].T + np.diag(Qd[k])
+            Ck = _erow(Cs, k); dk = _erow(ds, k)
+            Rk = np.diag(np.exp(-_erow(invE, k)))
+            yhat = Ck @ mpk + dk
+            S = Ck @ Ppk @ Ck.T + Rk
+            comp_ll[k] = _mvn_logpdf(y[t], yhat, S)
+            Sinv = np.linalg.inv(0.5 * (S + S.T) + 1e-10 * np.eye(N))
+            Kg = Ppk @ Ck.T @ Sinv
+            m_upd[k] = mpk + Kg @ (y[t] - yhat)
+            P_upd[k] = (eyeD - Kg @ Ck) @ Ppk
+
+        joint = log_bz_pred + comp_ll
+        denom = logsumexp(joint)
+        cpll += float(denom)
+        if t >= T_split:
+            cpll_oos += float(denom)
+        log_bz = joint - denom   # filtered z-belief at time t
+
+        w = np.exp(log_bz)
+        m_new = np.sum(w[:, None] * m_upd, axis=0)
+        P_new = np.zeros((D, D))
+        for k in range(K):
+            dmk = (m_upd[k] - m_new)[:, None]
+            P_new += w[k] * (P_upd[k] + dmk @ dmk.T)
+        m, P = m_new, P_new
+
+    return cpll, cpll_oos
 
 
 # ============================================================================
@@ -636,3 +695,281 @@ def inference_SLDS(px, mdl, y, T_train, cadence, dt=1/252, display=False):
             "max_cpll": float(max_cpll), "mdl": mdl}
 
 
+
+# ============================================================================
+# Test 3 (state dependence) — matched-component transition scoring.
+#
+# The candidate (fitted rSLDS) is compared against a null that shares EVERY
+# regime-conditional parameter (dynamics A,b,Q; emissions C,d,S) and differs
+# ONLY in the transition mechanism: the recurrent gate softmax(R x + r) is
+# replaced by a fixed time-homogeneous K x K matrix, estimated on the same
+# training window with all other parameters frozen (best-response null, via
+# the same causal filter likelihood used for scoring). The comparison is
+# nested with a single degree of freedom, so any predictive difference is
+# attributable to the state dependence of the transitions alone, and an
+# rSLDS/SLDS fit-collapse asymmetry cannot occur (both models own the same
+# regime-conditional densities).
+#
+# Both are scored with the h-step causal predictive log-likelihood
+#     CPLL_h = sum_t log p(y_{t+h} | y_{1:t})
+# (GPB1 filter; h-step belief propagation with NO intermediate updates). At
+# h = 1 the emission largely re-identifies the regime each step, so the
+# transition model barely enters the score; at h > 1 it is the only source
+# of regime-forecast information. Numerics are IDENTICAL for both transition
+# kinds (bounded dynamics-based P0, guarded lstsq seed, adaptive-jitter
+# Cholesky density, eigenvalue cap); the recurrent path at h = 1 reproduces
+# causal_cpll_rSLDS exactly. The gate is evaluated at the collapsed predicted
+# latent mean (point-gate approximation, as in the one-step scorer).
+# ============================================================================
+
+_T3_P_CEIL = 1e10
+_T3_P_FLOOR = 1e-12
+_T3_JIT0 = 1e-9
+
+
+def _t3_safe_mvn_logpdf(x, mean, cov, N, eyeN):
+    """log N(x | mean, cov) via jittered Cholesky; finite for degenerate cov."""
+    S = 0.5 * (cov + cov.T)
+    scale = max(1.0, np.trace(S) / max(N, 1))
+    jit = _T3_JIT0 * scale
+    L = None
+    for _ in range(8):
+        try:
+            L = np.linalg.cholesky(S + jit * eyeN)
+            break
+        except np.linalg.LinAlgError:
+            jit *= 10.0
+    if L is None:
+        return -1e12
+    diff = x - mean
+    z = np.linalg.solve(L, diff)
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return -0.5 * (N * np.log(2.0 * np.pi) + logdet + float(z @ z))
+
+
+def _t3_cap_cov(P):
+    P = 0.5 * (P + P.T)
+    ev, V = np.linalg.eigh(P)
+    ev = np.clip(ev, _T3_P_FLOOR, _T3_P_CEIL)
+    return (V * ev) @ V.T
+
+
+def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
+                  log_Ps=None, log_pi0=None):
+    """
+    h-step causal predictive log-likelihood, summed over all forecast targets
+    t' = h .. T-1 (full) and over t' >= T_split (OOS). Each target conditions
+    only on y_{1:t'-h}: the filter state at the origin is propagated h steps
+    through the dynamics and transition model with no intermediate updates.
+
+    transition_kind = "recurrent": gate softmax(Rs @ m + r) at the collapsed
+        predicted mean (read from mdl.transitions).
+    transition_kind = "standard": homogeneous matrix; pass log_Ps (K, K) and
+        log_pi0 (K,) explicitly (the matched null), or they are read from
+        mdl.transitions / mdl.init_state_distn.
+
+    Returns (cpll_h, cpll_h_oos). For h = 1 the recurrent path reproduces
+    causal_cpll_rSLDS (same filter, same numerics).
+    """
+    y = np.asarray(y, dtype=float)
+    if y.ndim == 1:
+        y = y[:, None]
+    T, N = y.shape
+    K = int(mdl.K)
+    D = int(mdl.D)
+    h = int(h)
+    assert h >= 1, f"h must be >= 1, got {h}"
+
+    As = np.asarray(mdl.dynamics.As, dtype=float)
+    bs = np.asarray(mdl.dynamics.bs, dtype=float)
+    Qd = np.clip(np.asarray(mdl.dynamics.sigmasq, dtype=float), 1e-12, None)
+    Cs = np.asarray(mdl.emissions.Cs, dtype=float)
+    ds = np.asarray(mdl.emissions.ds, dtype=float)
+    invE = np.asarray(mdl.emissions.inv_etas, dtype=float)
+
+    def _erow(arr, k):
+        arr = np.asarray(arr)
+        if arr.ndim == 1:
+            return arr
+        return arr[0] if arr.shape[0] == 1 else arr[k]
+
+    eyeD, eyeN = np.eye(D), np.eye(N)
+    recurrent = (transition_kind == "recurrent")
+    if recurrent:
+        Rs = np.asarray(mdl.transitions.Rs, dtype=float)
+        rvec = np.asarray(mdl.transitions.r, dtype=float)
+    else:
+        if log_Ps is None:
+            log_Ps = np.asarray(mdl.transitions.log_Ps, dtype=float)
+        log_Ps = log_Ps - logsumexp(log_Ps, axis=1, keepdims=True)
+        if log_pi0 is None:
+            log_pi0 = np.asarray(mdl.init_state_distn.log_pi0, dtype=float)
+        log_pi0 = log_pi0 - logsumexp(log_pi0)
+
+    Rk_all = [np.diag(np.exp(-_erow(invE, k))) for k in range(K)]
+    Ck_all = [_erow(Cs, k) for k in range(K)]
+    dk_all = [_erow(ds, k) for k in range(K)]
+
+    def _prior(m_cur, log_bz_cur):
+        if recurrent:
+            lp = Rs @ m_cur + rvec
+        else:
+            lp = logsumexp(log_bz_cur[:, None] + log_Ps, axis=0)
+        return lp - logsumexp(lp)
+
+    def _forecast(m, P, log_bz, y_tgt):
+        """h-step density of y_tgt from the filter state at the origin:
+        (h-1) GPB1 propagate-collapse steps, then a mixture one-step
+        predictive."""
+        m_cur, P_cur, lbz = m, P, log_bz
+        for _ in range(h - 1):
+            lp = _prior(m_cur, lbz)
+            w = np.exp(lp)
+            mks = np.empty((K, D))
+            Pks = np.empty((K, D, D))
+            for k in range(K):
+                mks[k] = As[k] @ m_cur + bs[k]
+                Pk = As[k] @ P_cur @ As[k].T + np.diag(Qd[k])
+                Pks[k] = 0.5 * (Pk + Pk.T)
+            m_new = np.sum(w[:, None] * mks, axis=0)
+            P_new = np.zeros((D, D))
+            for k in range(K):
+                dmk = (mks[k] - m_new)[:, None]
+                P_new += w[k] * (Pks[k] + dmk @ dmk.T)
+            m_cur, P_cur, lbz = m_new, _t3_cap_cov(P_new), lp
+        lp = _prior(m_cur, lbz)
+        comp = np.empty(K)
+        for k in range(K):
+            mpk = As[k] @ m_cur + bs[k]
+            Ppk = As[k] @ P_cur @ As[k].T + np.diag(Qd[k])
+            yhat = Ck_all[k] @ mpk + dk_all[k]
+            S = Ck_all[k] @ Ppk @ Ck_all[k].T + Rk_all[k]
+            comp[k] = _t3_safe_mvn_logpdf(y_tgt, yhat, S, N, eyeN)
+        return logsumexp(lp + comp)
+
+    # bounded, dynamics-based prior over x_0; guarded least-squares seed
+    rho_diag = np.stack([np.clip(np.abs(np.diag(As[k])), 0.0, 0.999)
+                         for k in range(K)])
+    stat_var = Qd / (1.0 - rho_diag ** 2)
+    P = np.diag(np.clip(np.median(stat_var, axis=0), _T3_P_FLOOR, _T3_P_CEIL))
+    m, *_ = np.linalg.lstsq(Cs[0], y[0] - ds[0], rcond=1e-6)
+    log_bz = (np.full(K, -np.log(K)) if recurrent else log_pi0.copy())
+
+    cpll_h = 0.0
+    cpll_h_oos = 0.0
+    # forecast from the origin t = 0 state (no update yet) for target t = h
+    if h <= T - 1:
+        val = _forecast(m, P, log_bz, y[h])
+        cpll_h += val
+        if h >= T_split:
+            cpll_h_oos += val
+
+    for t in range(1, T):
+        # ---- filter update at time t (identical for both kinds) ----
+        lp1 = _prior(m, log_bz)
+        comp = np.empty(K)
+        m_upd = np.empty((K, D))
+        P_upd = np.empty((K, D, D))
+        for k in range(K):
+            mpk = As[k] @ m + bs[k]
+            Ppk = As[k] @ P @ As[k].T + np.diag(Qd[k])
+            Ppk = 0.5 * (Ppk + Ppk.T)
+            yhat = Ck_all[k] @ mpk + dk_all[k]
+            S = Ck_all[k] @ Ppk @ Ck_all[k].T + Rk_all[k]
+            comp[k] = _t3_safe_mvn_logpdf(y[t], yhat, S, N, eyeN)
+            Ssym = 0.5 * (S + S.T) + 1e-10 * eyeN
+            Kg = np.linalg.solve(Ssym, Ck_all[k] @ Ppk).T
+            m_upd[k] = mpk + Kg @ (y[t] - yhat)
+            Pk = (eyeD - Kg @ Ck_all[k]) @ Ppk
+            P_upd[k] = 0.5 * (Pk + Pk.T)
+        joint = lp1 + comp
+        denom = logsumexp(joint)
+        w = np.exp(joint - denom)
+        m_new = np.sum(w[:, None] * m_upd, axis=0)
+        P_new = np.zeros((D, D))
+        for k in range(K):
+            dmk = (m_upd[k] - m_new)[:, None]
+            P_new += w[k] * (P_upd[k] + dmk @ dmk.T)
+        m, P = m_new, _t3_cap_cov(P_new)
+        log_bz = joint - denom
+
+        # ---- h-step forecast from the state at origin t ----
+        tgt = t + h
+        if tgt <= T - 1:
+            val = _forecast(m, P, log_bz, y[tgt])
+            cpll_h += val
+            if tgt >= T_split:
+                cpll_h_oos += val
+
+    return float(cpll_h), float(cpll_h_oos)
+
+
+def fit_null_transitions(mdl_r, y_tr, zhat_tr=None):
+    """
+    Estimate the matched null's (log_Ps, log_pi0) on the training window with
+    all regime-conditional parameters frozen at the fitted rSLDS values, by
+    maximizing the same causal filter likelihood used for scoring (h = 1).
+    Warm-started from Laplace-smoothed transition counts of the decoded
+    training path when available; mildly sticky uniform otherwise.
+    Nelder-Mead on the row logits (rows renormalized inside the objective);
+    falls back to the warm start if optimization does not improve on it.
+    """
+    from scipy.optimize import minimize
+
+    y_tr = np.asarray(y_tr, dtype=float)
+    if y_tr.ndim == 1:
+        y_tr = y_tr[:, None]
+    K = int(mdl_r.K)
+
+    if zhat_tr is not None and len(np.asarray(zhat_tr)) > 1:
+        z = np.asarray(zhat_tr, int)
+        cnt = np.ones((K, K))
+        for a, b in zip(z[:-1], z[1:]):
+            cnt[a, b] += 1.0
+        pi_cnt = np.bincount(z, minlength=K).astype(float) + 1.0
+    else:
+        cnt = np.ones((K, K)) + 9.0 * np.eye(K)
+        pi_cnt = np.ones(K)
+    L0 = np.log(cnt / cnt.sum(axis=1, keepdims=True))
+    log_pi0 = np.log(pi_cnt / pi_cnt.sum())
+
+    def _neg_cpll(theta):
+        Lps = theta.reshape(K, K)
+        Lps = Lps - logsumexp(Lps, axis=1, keepdims=True)
+        c, _ = causal_cpll_h(mdl_r, y_tr, T_split=y_tr.shape[0], h=1,
+                             transition_kind="standard",
+                             log_Ps=Lps, log_pi0=log_pi0)
+        return -c
+
+    f0 = _neg_cpll(L0.ravel())
+    res = minimize(_neg_cpll, L0.ravel(), method="Nelder-Mead",
+                   options={"maxiter": 200 * K * K, "xatol": 1e-3,
+                            "fatol": 1e-4})
+    theta = res.x if (np.isfinite(res.fun) and res.fun <= f0) else L0.ravel()
+    log_Ps = theta.reshape(K, K)
+    log_Ps = log_Ps - logsumexp(log_Ps, axis=1, keepdims=True)
+    return log_Ps, log_pi0
+
+
+def t3_pair_scores(mdl_r, y_tr, y_joint, T_split, h_grid=(1, 4), zhat_tr=None):
+    """
+    T3 scoring for one (security, batch): fit the matched null on the
+    training window, then score candidate and null on the joint [train, test]
+    series at each horizon in h_grid. Returns a flat dict of per-batch
+    columns:
+        cpll{h}_oos        — rSLDS h-step OOS CPLL
+        cpll{h}_null_oos   — matched-null h-step OOS CPLL
+        t3_gap_h{h}        — their difference (the T3 per-batch gap)
+    """
+    log_Ps, log_pi0 = fit_null_transitions(mdl_r, y_tr, zhat_tr=zhat_tr)
+    out = {}
+    for h in h_grid:
+        _, oos_r = causal_cpll_h(mdl_r, y_joint, T_split, h=h,
+                                 transition_kind="recurrent")
+        _, oos_0 = causal_cpll_h(mdl_r, y_joint, T_split, h=h,
+                                 transition_kind="standard",
+                                 log_Ps=log_Ps, log_pi0=log_pi0)
+        out[f"cpll{h}_oos"] = float(oos_r)
+        out[f"cpll{h}_null_oos"] = float(oos_0)
+        out[f"t3_gap_h{h}"] = float(oos_r - oos_0)
+    return out

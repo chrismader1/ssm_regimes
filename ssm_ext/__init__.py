@@ -16,12 +16,13 @@ Public API:
 
 from .fit import (
     fit_rSLDS, fit_rSLDS_restricted, fit_rSLDS_restricted_em,
-    fit_SLDS, fit_SLDS_restricted, fit_SLDS_restricted_em,
+    fit_SLDS, fit_SLDS_restricted,
     fit_HMM, fit_AR_HMM,
 )
 from .inference import (
     inference_rSLDS, inference_SLDS, causal_cpll_SLDS,
     inference_HMM, inference_ARHMM, filter_states_causal,
+    causal_cpll_h, fit_null_transitions, t3_pair_scores,
 )
 from .evaluate import (
     evaluate_regimes_synthetic, evaluate_regimes_actual,
@@ -37,8 +38,8 @@ from .params import extract_params_records
 from .init import fit_kmeans
 
 __all__ = [
-    "fit_rSLDS", "fit_rSLDS_restricted", "fit_rSLDS_restricted_em",
-    "fit_SLDS", "fit_SLDS_restricted", "fit_SLDS_restricted_em",
+    "fit_rSLDS", "fit_rSLDS_restricted",
+    "fit_SLDS", "fit_SLDS_restricted",
     "fit_HMM", "fit_AR_HMM",
     "inference_rSLDS", "inference_SLDS", "causal_cpll_SLDS",
     "inference_HMM", "inference_ARHMM", "filter_states_causal",
