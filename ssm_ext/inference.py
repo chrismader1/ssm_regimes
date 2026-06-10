@@ -904,22 +904,32 @@ def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
     return float(cpll_h), float(cpll_h_oos)
 
 
-def fit_null_transitions(mdl_r, y_tr, zhat_tr=None):
+def fit_null_transitions(mdl_r, y_tr, zhat_tr=None, n_grid=9, gss_iter=0):
     """
     Estimate the matched null's (log_Ps, log_pi0) on the training window with
     all regime-conditional parameters frozen at the fitted rSLDS values, by
     maximizing the same causal filter likelihood used for scoring (h = 1).
-    Warm-started from Laplace-smoothed transition counts of the decoded
-    training path when available; mildly sticky uniform otherwise.
-    Nelder-Mead on the row logits (rows renormalized inside the objective);
-    falls back to the warm start if optimization does not improve on it.
-    """
-    from scipy.optimize import minimize
 
+    Each transition row is parametrized by ONE number -- its stay-probability
+    p_k = P[k->k] -- with the remaining 1-p_k mass split across the other
+    states in the proportions of the warm-start counts (the decoded-path
+    transition counts, Laplace-smoothed). This reduces the row to a smooth 1-D
+    problem on p_k in (0, 1), solved by a coarse grid followed by golden-
+    section refinement. For K = 2 this is exactly the single free parameter of
+    a 2x2 homogeneous matrix; the objective and optimum are identical to a
+    full matrix search, at a few dozen filter passes instead of hundreds.
+    Rows are optimized coordinate-wise (one pass; the rows are near-separable
+    in the causal likelihood and a single sweep is stable in practice). Falls
+    back to the warm-start row if a sweep does not improve on it.
+
+    init_state distn is the Laplace-smoothed empirical regime frequency of the
+    decoded training path (unchanged from before).
+    """
     y_tr = np.asarray(y_tr, dtype=float)
     if y_tr.ndim == 1:
         y_tr = y_tr[:, None]
     K = int(mdl_r.K)
+    Tw = y_tr.shape[0]
 
     if zhat_tr is not None and len(np.asarray(zhat_tr)) > 1:
         z = np.asarray(zhat_tr, int)
@@ -930,23 +940,70 @@ def fit_null_transitions(mdl_r, y_tr, zhat_tr=None):
     else:
         cnt = np.ones((K, K)) + 9.0 * np.eye(K)
         pi_cnt = np.ones(K)
-    L0 = np.log(cnt / cnt.sum(axis=1, keepdims=True))
+    P0 = cnt / cnt.sum(axis=1, keepdims=True)        # warm-start matrix
     log_pi0 = np.log(pi_cnt / pi_cnt.sum())
 
-    def _neg_cpll(theta):
-        Lps = theta.reshape(K, K)
-        Lps = Lps - logsumexp(Lps, axis=1, keepdims=True)
-        c, _ = causal_cpll_h(mdl_r, y_tr, T_split=y_tr.shape[0], h=1,
+    EPS = 1e-4
+
+    # off-diagonal split proportions per row (from warm-start counts)
+    off_share = np.zeros((K, K))
+    if K > 1:
+        for k in range(K):
+            mask = np.ones(K, bool); mask[k] = False
+            w = cnt[k, mask].copy()
+            w = w / w.sum() if w.sum() > 0 else np.full(K - 1, 1.0 / (K - 1))
+            off_share[k, mask] = w
+
+    def _row_from_p(k, p):
+        """Build transition row k with stay-prob p, off-diagonals scaled to 1-p."""
+        row = (1.0 - p) * off_share[k]
+        row[k] = p
+        return row
+
+    Pmat = P0.copy()
+
+    def _neg_cpll(Pm):
+        log_Ps = np.log(np.clip(Pm, 1e-300, None))
+        log_Ps = log_Ps - logsumexp(log_Ps, axis=1, keepdims=True)
+        c, _ = causal_cpll_h(mdl_r, y_tr, T_split=Tw, h=1,
                              transition_kind="standard",
-                             log_Ps=Lps, log_pi0=log_pi0)
+                             log_Ps=log_Ps, log_pi0=log_pi0)
         return -c
 
-    f0 = _neg_cpll(L0.ravel())
-    res = minimize(_neg_cpll, L0.ravel(), method="Nelder-Mead",
-                   options={"maxiter": 200 * K * K, "xatol": 1e-3,
-                            "fatol": 1e-4})
-    theta = res.x if (np.isfinite(res.fun) and res.fun <= f0) else L0.ravel()
-    log_Ps = theta.reshape(K, K)
+    def _obj_row(k, p):
+        trial = Pmat.copy()
+        trial[k] = _row_from_p(k, p)
+        return _neg_cpll(trial)
+
+    if K == 1:
+        return np.zeros((1, 1)), log_pi0    # log P[0->0]=0; no free parameter
+
+    for k in range(K):
+        f0 = _obj_row(k, float(P0[k, k]))
+        # coarse grid
+        grid = np.linspace(EPS, 1.0 - EPS, n_grid)
+        fg = np.array([_obj_row(k, float(p)) for p in grid])
+        j = int(np.argmin(fg))
+        a = grid[max(j - 1, 0)]; b = grid[min(j + 1, n_grid - 1)]
+        # golden-section refine on [a, b]
+        gr = (np.sqrt(5.0) - 1.0) / 2.0
+        c = b - gr * (b - a); d = a + gr * (b - a)
+        fc = _obj_row(k, float(c)); fd = _obj_row(k, float(d))
+        for _ in range(gss_iter):
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a); fc = _obj_row(k, float(c))
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a); fd = _obj_row(k, float(d))
+        p_star = 0.5 * (a + b)
+        f_star = _obj_row(k, float(p_star))
+        # keep the best of {warm start, grid argmin, refined}
+        cands = [(f0, float(P0[k, k])), (fg[j], float(grid[j])), (f_star, float(p_star))]
+        _, p_best = min(cands, key=lambda t: t[0])
+        Pmat[k] = _row_from_p(k, p_best)
+
+    log_Ps = np.log(np.clip(Pmat, 1e-300, None))
     log_Ps = log_Ps - logsumexp(log_Ps, axis=1, keepdims=True)
     return log_Ps, log_pi0
 
