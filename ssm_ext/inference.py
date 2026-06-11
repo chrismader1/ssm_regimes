@@ -762,8 +762,13 @@ def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
     only on y_{1:t'-h}: the filter state at the origin is propagated h steps
     through the dynamics and transition model with no intermediate updates.
 
-    transition_kind = "recurrent": gate softmax(Rs @ m + r) at the collapsed
-        predicted mean (read from mdl.transitions).
+    transition_kind = "recurrent_only": gate softmax(Rs @ m + r) at the
+        collapsed predicted mean (Linderman rSLDS(ro); memoryless prior).
+    transition_kind = "recurrent": full rSLDS(s) -- per-state matrix plus
+        shared gate, log p(z'=j|z=i,x) prop log_Ps[i,j] + Rs[j].m + kappa*1[i==j]
+        (kappa read from mdl.transitions if present); the regime belief is
+        carried through the filter. At Rs = 0 this branch is EXACTLY the
+        "standard" branch with matrix log_Ps + kappa*I (the nesting identity).
     transition_kind = "standard": homogeneous matrix; pass log_Ps (K, K) and
         log_pi0 (K,) explicitly (the matched null), or they are read from
         mdl.transitions / mdl.init_state_distn.
@@ -794,10 +799,23 @@ def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
         return arr[0] if arr.shape[0] == 1 else arr[k]
 
     eyeD, eyeN = np.eye(D), np.eye(N)
-    recurrent = (transition_kind == "recurrent")
-    if recurrent:
+    rec_only = (transition_kind == "recurrent_only")
+    rec_full = (transition_kind == "recurrent")
+    if transition_kind not in ("recurrent_only", "recurrent", "standard"):
+        raise ValueError("transition_kind must be 'recurrent_only', 'recurrent' or "
+                         f"'standard', got {transition_kind!r}")
+    if rec_only:
         Rs = np.asarray(mdl.transitions.Rs, dtype=float)
         rvec = np.asarray(mdl.transitions.r, dtype=float)
+    elif rec_full:
+        # full rSLDS(s): log p(z'=j | z=i, x) prop log_Ps[i,j] + Rs[j].x + kappa*1[i==j]
+        Rs = np.asarray(mdl.transitions.Rs, dtype=float)            # (K, D)
+        log_Ps = np.asarray(mdl.transitions.log_Ps, dtype=float)    # (K, K)
+        kappa = float(getattr(mdl.transitions, "kappa", 0.0))
+        log_Ps_eff = log_Ps + kappa * np.eye(K)
+        if log_pi0 is None:
+            log_pi0 = np.asarray(mdl.init_state_distn.log_pi0, dtype=float)
+        log_pi0 = log_pi0 - logsumexp(log_pi0)
     else:
         if log_Ps is None:
             log_Ps = np.asarray(mdl.transitions.log_Ps, dtype=float)
@@ -811,8 +829,15 @@ def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
     dk_all = [_erow(ds, k) for k in range(K)]
 
     def _prior(m_cur, log_bz_cur):
-        if recurrent:
+        """One-step regime prior given current collapsed mean / belief."""
+        if rec_only:
             lp = Rs @ m_cur + rvec
+        elif rec_full:
+            # row-wise transition logits at x = m_cur, kappa included, rows
+            # normalised; then mixed through the carried belief.
+            L = log_Ps_eff + (Rs @ m_cur)[None, :]            # (K, K)
+            L = L - logsumexp(L, axis=1, keepdims=True)
+            lp = logsumexp(log_bz_cur[:, None] + L, axis=0)
         else:
             lp = logsumexp(log_bz_cur[:, None] + log_Ps, axis=0)
         return lp - logsumexp(lp)
@@ -853,7 +878,7 @@ def causal_cpll_h(mdl, y, T_split, h=4, transition_kind="recurrent",
     stat_var = Qd / (1.0 - rho_diag ** 2)
     P = np.diag(np.clip(np.median(stat_var, axis=0), _T3_P_FLOOR, _T3_P_CEIL))
     m, *_ = np.linalg.lstsq(Cs[0], y[0] - ds[0], rcond=1e-6)
-    log_bz = (np.full(K, -np.log(K)) if recurrent else log_pi0.copy())
+    log_bz = (np.full(K, -np.log(K)) if rec_only else log_pi0.copy())
 
     cpll_h = 0.0
     cpll_h_oos = 0.0
@@ -1019,10 +1044,20 @@ def t3_pair_scores(mdl_r, y_tr, y_joint, T_split, h_grid=(1, 4), zhat_tr=None):
         t3_gap_h{h}        — their difference (the T3 per-batch gap)
     """
     log_Ps, log_pi0 = fit_null_transitions(mdl_r, y_tr, zhat_tr=zhat_tr)
+    # auto-detect the candidate's transition kind from its parameters:
+    # Rs + r -> recurrent_only (rSLDS(ro)); Rs + log_Ps -> recurrent (rSLDS(s))
+    tr = mdl_r.transitions
+    if hasattr(tr, "Rs") and hasattr(tr, "r"):
+        cand_kind = "recurrent_only"
+    elif hasattr(tr, "Rs") and hasattr(tr, "log_Ps"):
+        cand_kind = "recurrent"
+    else:
+        raise ValueError("t3_pair_scores: candidate must be an rSLDS "
+                         f"(recurrent transitions), got {type(tr).__name__}")
     out = {}
     for h in h_grid:
         _, oos_r = causal_cpll_h(mdl_r, y_joint, T_split, h=h,
-                                 transition_kind="recurrent")
+                                 transition_kind=cand_kind)
         _, oos_0 = causal_cpll_h(mdl_r, y_joint, T_split, h=h,
                                  transition_kind="standard",
                                  log_Ps=log_Ps, log_pi0=log_pi0)

@@ -10,7 +10,9 @@ from .init import fit_kmeans
 
 import autograd.numpy as _anp
 from autograd.scipy.special import logsumexp as _ag_logsumexp
-from ssm.transitions import RecurrentOnlyTransitions as _RecOnly, StationaryTransitions as _Stationary
+from ssm.transitions import (RecurrentOnlyTransitions as _RecOnly,
+                             StationaryTransitions as _Stationary,
+                             RecurrentTransitions as _Recurrent)
 
 
 # ---------------------------------------------------------------
@@ -51,6 +53,30 @@ class StickyRecurrentOnly(_RecOnly):
 
     def log_transition_matrices(self, data, input, mask, tag):
         lp = super(StickyRecurrentOnly, self).log_transition_matrices(
+            data, input, mask, tag)
+        lp = lp + self.kappa * _anp.eye(self.K)[None, :, :]
+        return lp - _ag_logsumexp(lp, axis=2, keepdims=True)
+
+
+class StickyRecurrent(_Recurrent):
+    """Full rSLDS(s) transitions (Linderman 2017 Eq. 4, shared-weights variant)
+    with the SAME Fox-2011 self-transition stickiness as the other two sticky
+    classes. Combines a per-state Markov matrix with a shared recurrence term:
+
+        log p(z_t=j | z_{t-1}=i, x) = log_Ps[i,j] + R_j.x + kappa * 1[i==j]
+
+    (then renormalised). Setting R=0 recovers exactly StickyStandard, so a
+    fixed-matrix null is NESTED in this candidate -- the property the
+    state-dependence test (T3) relies on. kappa is a constant; not added to
+    params, not optimised in the M-step.
+    """
+
+    def __init__(self, K, D, M, kappa):
+        super(StickyRecurrent, self).__init__(K, D, M=M)
+        self.kappa = float(kappa)
+
+    def log_transition_matrices(self, data, input, mask, tag):
+        lp = super(StickyRecurrent, self).log_transition_matrices(
             data, input, mask, tag)
         lp = lp + self.kappa * _anp.eye(self.K)[None, :, :]
         return lp - _ag_logsumexp(lp, axis=2, keepdims=True)
@@ -168,11 +194,19 @@ def _estimate_masked_loadings(C, d, y, C_mask):
 # Fit rSLDS
 # ---------------------------------------------------------------
 
-def fit_rSLDS(y, params, n_iter_em=50, seed=None):
+def fit_rSLDS(y, params, n_iter_em=50, seed=None, transition_kind="recurrent"):
     
     """
     params: dict(n_regimes, dim_latent, single_subspace)
+    transition_kind: "recurrent" (default; Eq.4 shared variant; nu = log_Ps[z_t] + R.x,
+                     nests the fixed-matrix SLDS at R=0) or "recurrent_only"
+                     (legacy Linderman rSLDS(ro); nu = R.x + r; no Markov term,
+                     does NOT nest the SLDS). Both are native ssm transition
+                     classes.
     """
+    if transition_kind not in ("recurrent_only", "recurrent"):
+        raise ValueError("transition_kind must be 'recurrent_only' or 'recurrent', "
+                         f"got {transition_kind!r}")
 
     if seed is not None:
         np.random.seed(seed)
@@ -201,7 +235,7 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None):
 
     # INSTANTIATE MODEL
     mdl = ssm.SLDS(N, K, D,
-                   transitions="recurrent_only",
+                   transitions=transition_kind,
                    dynamics="diagonal_gaussian",
                    emissions="gaussian",
                    single_subspace=single_subspace)
@@ -610,7 +644,7 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
                              # the highest-ELBO iterate is retained as a drift guard.
     min_occupancy=0.05,      # per-regime usage floor; an EM run that drops the occupied-regime
                              # count below the closed-form's is rejected in favour of that fit
-    transition_kind="recurrent_only"):  # "recurrent_only" -> rSLDS (StickyRecurrentOnly gate);
+    transition_kind="recurrent"):  # default: Eq.4 shared variant (nests SLDS at R=0);
                              # "standard" -> SLDS (StickyStandard fixed matrix). Same kappa, same
                              # warm-up / EM / occupancy-revert: the ONLY difference is the gate form.
 
@@ -692,30 +726,47 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         (C_mask is not None and np.any(np.asarray(C_mask) != 0)) or
         (d_mask is not None and np.any(np.asarray(d_mask) != 0)))
 
-    # ----- transition kind: rSLDS (recurrent gate) vs SLDS (fixed matrix), both
-    #       carrying the SAME Fox sticky kappa so a like-for-like rSLDS/SLDS
-    #       comparison isolates only the recurrent term R.x.
-    if transition_kind not in ("recurrent_only", "standard"):
-        raise ValueError("transition_kind must be 'recurrent_only' or 'standard', "
-                         f"got {transition_kind!r}")
-    _recurrent = (transition_kind == "recurrent_only")
-    _closed_form_fn    = fit_rSLDS_restricted if _recurrent else fit_SLDS_restricted
-    _trans_param_names = ("Rs", "r") if _recurrent else ("log_Ps",)
+    # ----- transition kind: rSLDS gate variants vs SLDS (fixed matrix), all
+    #       carrying the SAME Fox sticky kappa so like-for-like comparisons
+    #       isolate only the transition functional form.
+    #   recurrent_only : nu = R.x + r              (Linderman rSLDS(ro); no z_t term)
+    #   recurrent      : nu = log_Ps[z_t] + R.x    (Linderman Eq.4 shared variant;
+    #                    nests the fixed matrix at R=0)
+    #   standard       : fixed K x K matrix        (SLDS)
+    if transition_kind not in ("recurrent_only", "recurrent", "standard"):
+        raise ValueError("transition_kind must be 'recurrent_only', 'recurrent' "
+                         f"or 'standard', got {transition_kind!r}")
+    _rec_only = (transition_kind == "recurrent_only")
+    _rec_full = (transition_kind == "recurrent")
+    # closed-form warm start: recurrent_only seeds from the closed-form gate fit;
+    # 'recurrent' seeds from the closed-form FIXED-MATRIX fit with Rs left at 0,
+    # i.e. EM starts exactly at the nested null and learns R from there.
+    _closed_form_fn    = fit_rSLDS_restricted if _rec_only else fit_SLDS_restricted
+    # names transplanted FROM the closed-form fit (the closed-form model only
+    # owns these); 'recurrent' additionally owns Rs, which stays at its zero init.
+    _warm_trans_names  = ("Rs", "r") if _rec_only else ("log_Ps",)
+    # names snapshotted/restored during EM (everything the live model optimises)
+    _trans_param_names = (("Rs", "r") if _rec_only
+                          else (("log_Ps", "Rs") if _rec_full else ("log_Ps",)))
 
     # ----- model
     mdl = ssm.SLDS(
         N, K, D,
-        transitions=("recurrent_only" if _recurrent else "standard"),  # placeholder; swapped below
+        transitions=("recurrent_only" if _rec_only
+                     else ("recurrent" if _rec_full else "standard")),  # placeholder; swapped below
         dynamics="diagonal_gaussian",
         emissions="gaussian",
         single_subspace=True,)
 
-    # Swap the gate for the sticky variant carrying kappa=_STICKY_KAPPA on BOTH
+    # Swap the gate for the sticky variant carrying kappa=_STICKY_KAPPA on ALL
     # classes (Fox 2011 stickiness):
     #   recurrent_only -> StickyRecurrentOnly  (Linderman 2017 gate)
+    #   recurrent      -> StickyRecurrent      (Eq.4 shared variant, nests standard)
     #   standard       -> StickyStandard       (fixed K x K matrix)
-    if _recurrent:
+    if _rec_only:
         mdl.transitions = StickyRecurrentOnly(K, D, M=0, kappa=_STICKY_KAPPA)
+    elif _rec_full:
+        mdl.transitions = StickyRecurrent(K, D, M=0, kappa=_STICKY_KAPPA)
     else:
         mdl.transitions = StickyStandard(K, D, M=0, kappa=_STICKY_KAPPA)
 
@@ -874,7 +925,7 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     if warm_start and (C is not None) and (d is not None):
         base_state = _closed_form_warmstart(
             mdl, y, params, closed_form_fn=_closed_form_fn,
-            trans_param_names=_trans_param_names, C=C, d=d, n_iter_em=n_iter_em,
+            trans_param_names=_warm_trans_names, C=C, d=d, n_iter_em=n_iter_em,
             seed=seed, b_pattern=b_pattern, enforce_diag_A=enforce_diag_A,
             C_mask=C_mask, d_mask=d_mask, q_min=q_min)
 
@@ -1156,6 +1207,22 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
             print(f"[em-revert] K={K} D={D} N={N}: EM occupied {em_used}/{K} regimes "
                   f"vs closed-form {base_used}/{K} (floor={min_occupancy}) -> "
                   f"closed-form fit retained", flush=True)
+            if _rec_full:
+                # base_mdl is the closed-form FIXED-MATRIX fit (different
+                # transition class, no kappa). Return the live recurrent model
+                # restored to the warm-start state instead: same parameters,
+                # Rs=0 (the nested null), correct class for downstream scoring.
+                mdl.dynamics.As      = np.array(base_mdl.dynamics.As, dtype=float)
+                mdl.dynamics.bs      = np.array(base_mdl.dynamics.bs, dtype=float)
+                mdl.dynamics.sigmasq = np.maximum(
+                    np.array(base_mdl.dynamics.sigmasq, dtype=float), q_min)
+                mdl.emissions.Cs       = np.array(base_mdl.emissions.Cs, dtype=float)
+                mdl.emissions.ds       = np.array(base_mdl.emissions.ds, dtype=float)
+                mdl.emissions.inv_etas = np.array(base_mdl.emissions.inv_etas, dtype=float)
+                mdl.transitions.log_Ps = np.array(base_mdl.transitions.log_Ps, dtype=float)
+                mdl.transitions.Rs     = np.zeros_like(np.asarray(mdl.transitions.Rs))
+                return (x_base, z_base, np.asarray(elbo_trace, dtype=float),
+                        q_base, mdl)
             return (x_base, z_base, np.asarray(elbo_trace, dtype=float),
                     q_base, base_mdl)
 
