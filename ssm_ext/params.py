@@ -24,6 +24,7 @@ def print_rSLDS_matrices(model, restricted=False, dt=None, latent_names=None):
             "sigmasq": "(K, D)",
             "Rs": "(K, D)",
             "r": "(K,)",
+            "log_Ps": "(K, K)",
         }[semantic_key]
         # IMPORTANT: two spaces after label to match OLD
         print(f"{label}  {semantic_shape_str} = {arr.shape}")

@@ -136,8 +136,12 @@ def _closed_form_warmstart(mdl, y, params, *, closed_form_fn, trans_param_names,
     mdl.dynamics.bs      = np.array(base_mdl.dynamics.bs, dtype=float)
     mdl.dynamics.sigmasq = np.maximum(np.array(base_mdl.dynamics.sigmasq, dtype=float), q_min)
     for nm in trans_param_names:
-        setattr(mdl.transitions, nm,
-                np.array(getattr(base_mdl.transitions, nm), dtype=float))
+        # transplant only parameters the TARGET class actually owns: setattr on a
+        # missing name would create a stray attribute (e.g. .r on a recurrent
+        # model), corrupting transition-kind detection downstream.
+        if hasattr(mdl.transitions, nm) and hasattr(base_mdl.transitions, nm):
+            setattr(mdl.transitions, nm,
+                    np.array(getattr(base_mdl.transitions, nm), dtype=float))
     if copy_emissions:
         mdl.emissions.Cs       = np.array(base_mdl.emissions.Cs, dtype=float)
         mdl.emissions.ds       = np.array(base_mdl.emissions.ds, dtype=float)
@@ -265,7 +269,10 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None, transition_kind="recurrent"):
 
         # recurrent transition weights R, r
         mdl.transitions.Rs = 0.01 * np.random.randn(K, D)
-        mdl.transitions.r = np.zeros(K)
+        if transition_kind == "recurrent_only":
+            # gate bias exists only on RecurrentOnlyTransitions; never stamp it
+            # onto RecurrentTransitions (corrupts transition-kind detection).
+            mdl.transitions.r = np.zeros(K)
 
         # The init below mirrors what ssm.SLDS.initialize does in the
         # well-specified case (data-informed per-regime b_k anchoring), but
@@ -391,7 +398,9 @@ def fit_rSLDS(y, params, n_iter_em=50, seed=None, transition_kind="recurrent"):
         _d0 = np.array(mdl.emissions.ds[0], dtype=float)
         _wb_state = _closed_form_warmstart(
             mdl, y, params, closed_form_fn=fit_rSLDS_restricted,
-            trans_param_names=("Rs", "r"), C=_C0, d=_d0,
+            trans_param_names=(("Rs", "r") if transition_kind == "recurrent_only"
+                               else ("Rs",)),
+            C=_C0, d=_d0,
             n_iter_em=n_iter_em, seed=seed, copy_emissions=False)
 
     # FIT MODEL
