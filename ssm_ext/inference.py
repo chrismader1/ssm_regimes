@@ -204,6 +204,13 @@ def causal_cpll_rSLDS(mdl, y, T_split):
     these guards (its P never approaches the ceiling, its S is well-conditioned);
     the guards only stop the free/identity families from returning garbage.
     """
+    # Full recurrent transitions (log_Ps + Rs, e.g. StickyRecurrent) are scored
+    # by the shared-core h-step scorer at h=1, which carries the regime belief
+    # and includes kappa. The legacy body below is the recurrent_only gate.
+    _tr = mdl.transitions
+    if hasattr(_tr, "log_Ps") and hasattr(_tr, "Rs"):
+        return causal_cpll_h(mdl, y, T_split, h=1, transition_kind="recurrent")
+
     y = np.asarray(y, dtype=float)
     if y.ndim == 1:
         y = y[:, None]
@@ -1047,10 +1054,12 @@ def t3_pair_scores(mdl_r, y_tr, y_joint, T_split, h_grid=(1, 4), zhat_tr=None):
     # auto-detect the candidate's transition kind from its parameters:
     # Rs + r -> recurrent_only (rSLDS(ro)); Rs + log_Ps -> recurrent (rSLDS(s))
     tr = mdl_r.transitions
-    if hasattr(tr, "Rs") and hasattr(tr, "r"):
-        cand_kind = "recurrent_only"
-    elif hasattr(tr, "Rs") and hasattr(tr, "log_Ps"):
+    # log_Ps is checked FIRST: it exists only on the full recurrent class, so
+    # detection cannot be corrupted by an incidental .r attribute.
+    if hasattr(tr, "Rs") and hasattr(tr, "log_Ps"):
         cand_kind = "recurrent"
+    elif hasattr(tr, "Rs") and hasattr(tr, "r"):
+        cand_kind = "recurrent_only"
     else:
         raise ValueError("t3_pair_scores: candidate must be an rSLDS "
                          f"(recurrent transitions), got {type(tr).__name__}")

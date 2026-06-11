@@ -56,8 +56,12 @@ def print_rSLDS_matrices(model, restricted=False, dt=None, latent_names=None):
     pmat(model.dynamics.As, "As", "As")
     pmat(model.dynamics.bs, "bs", "bs")
     pmat(model.dynamics.sigmasq, "sigmasq", "sigmasq")
-    pmat(model.transitions.Rs, "Rs", "Rs")
-    pmat(model.transitions.r, "r", "r")
+    if hasattr(model.transitions, "Rs"):
+        pmat(model.transitions.Rs, "Rs", "Rs")
+    if getattr(model.transitions, "r", None) is not None:
+        pmat(model.transitions.r, "r", "r")
+    if getattr(model.transitions, "log_Ps", None) is not None:
+        pmat(model.transitions.log_Ps, "log_Ps", "log_Ps")
 
     # Regime-type classification
     print("Dynamics: xₜ = a⋅xₜ₋₁ + b + ε")
@@ -382,7 +386,18 @@ def extract_params_records(model, model_type, K, D, N, batch_id):
         bs       = np.asarray(model.dynamics.bs,      dtype=float)   # (K, D)
         sigmasq  = np.asarray(model.dynamics.sigmasq, dtype=float)   # (K, D)
         Rs       = np.asarray(model.transitions.Rs,   dtype=float)   # (K, D)
-        r_vec    = np.asarray(model.transitions.r,    dtype=float)   # (K,)
+        # transition family: recurrent_only carries r (gate bias); the full
+        # recurrent class carries log_Ps (+ kappa). Read both defensively.
+        _r_attr  = getattr(model.transitions, "r", None)
+        r_vec    = (np.asarray(_r_attr, dtype=float) if _r_attr is not None
+                    else np.full(K, np.nan))
+        _lp_attr = getattr(model.transitions, "log_Ps", None)
+        if _lp_attr is not None:
+            _kap   = float(getattr(model.transitions, "kappa", 0.0))
+            lp_eff = np.asarray(_lp_attr, dtype=float) + _kap * np.eye(K)
+            lp_eff = lp_eff - logsumexp(lp_eff, axis=1, keepdims=True)
+        else:
+            lp_eff = None
         Cs       = np.asarray(model.emissions.Cs,     dtype=float)   # (1,N,D) or (K,N,D)
         ds       = np.asarray(model.emissions.ds,     dtype=float)   # (1,N) or (K,N)
         invE     = np.asarray(model.emissions.inv_etas, dtype=float) # (1,N) or (K,N)
@@ -412,9 +427,11 @@ def extract_params_records(model, model_type, K, D, N, batch_id):
                 "inv_etas":        json.dumps(invE_k.tolist()),
                 "A_obs":           None,
                 "b_obs":           None,
-                "transition_self": float("nan"),
+                "transition_self": (float(np.exp(lp_eff[k, k]))
+                                    if lp_eff is not None else float("nan")),
                 "log_pi0":         float(log_pi0_full[k]),
-                "log_Ps":          None,
+                "log_Ps":          (json.dumps(lp_eff[k].tolist())
+                                    if lp_eff is not None else None),
             })
         return out
 

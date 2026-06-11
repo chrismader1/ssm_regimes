@@ -884,7 +884,11 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         mdl.dynamics.bs     = bs_init
         mdl.dynamics.sigmasq = sigmasq_init
         mdl.transitions.Rs   = 0.1 * npr.randn(K, D)
-        mdl.transitions.r    = np.zeros(K)
+        if _rec_only:
+            # gate bias exists only on the recurrent_only class; setting it on
+            # StickyRecurrent would create a stray attribute and corrupt
+            # transition-kind detection downstream.
+            mdl.transitions.r = np.zeros(K)
 
         # Data-driven persistence cap for the M-step. ssm's AR(1) dynamics
         # M-step trades drift (b) for persistence (A), walking A toward the
