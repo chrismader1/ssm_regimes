@@ -1194,6 +1194,8 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     elif base_state is not None:
         x_base, z_base, q_base, base_mdl, _ = base_state
         print(f"[em-fallback] K={K} D={D} N={N}: EM diverged -> closed-form fit retained", flush=True)
+        base_mdl._em_converged = False
+        base_mdl._em_iters = int(iters_done)
         return x_base, z_base, np.asarray([], dtype=float), q_base, base_mdl
     else:
         raise RuntimeError("Laplace-EM failed and no closed-form fallback was available.")
@@ -1234,8 +1236,12 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
                 mdl.emissions.inv_etas = np.array(base_mdl.emissions.inv_etas, dtype=float)
                 mdl.transitions.log_Ps = np.array(base_mdl.transitions.log_Ps, dtype=float)
                 mdl.transitions.Rs     = np.zeros_like(np.asarray(mdl.transitions.Rs))
+                mdl._em_converged = bool(converged)
+                mdl._em_iters = int(iters_done)
                 return (x_base, z_base, np.asarray(elbo_trace, dtype=float),
                         q_base, mdl)
+            base_mdl._em_converged = bool(converged)
+            base_mdl._em_iters = int(iters_done)
             return (x_base, z_base, np.asarray(elbo_trace, dtype=float),
                     q_base, base_mdl)
 
@@ -1244,6 +1250,10 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     if base_state is not None and K > 1:
         print(f"[em-accept] K={K} D={D} N={N}: EM fit accepted (occupancy guard passed)",
               flush=True)
+    # EM diagnostics for downstream persistence (no signature change): the
+    # convergence decision and iteration count are otherwise log-only.
+    mdl._em_converged = bool(converged)
+    mdl._em_iters = int(iters_done)
     return xhat, zhat, np.asarray(elbo_trace, dtype=float), q_use, mdl
 
 
