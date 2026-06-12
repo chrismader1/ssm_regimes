@@ -892,12 +892,47 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
         mdl.dynamics.As     = As_init
         mdl.dynamics.bs     = bs_init
         mdl.dynamics.sigmasq = sigmasq_init
-        mdl.transitions.Rs   = 0.1 * npr.randn(K, D)
+        # ----- transition warm start: supervised softmax gate.
+        # Fit Rs (and, for recurrent_only, r) by multinomial logistic regression
+        # of the next-step regime label on x_proxy, on the FIXED k-means labels
+        # -- the same gate fit used by the closed-form fitter and by Linderman's
+        # decision-list init. Without this the gate starts at R~0, EM frequently
+        # fails to escape that degenerate point, and kappa stickiness then
+        # collapses the chain to a single regime. Labels are remapped through
+        # old_to_new so regime indices match the sorted dynamics ordering above.
+        from sklearn.linear_model import LogisticRegression
+        labels_sorted = old_to_new[labels]              # (T,) in sorted-regime indexing
+        Rs_init = np.zeros((K, D))
+        r_init = np.zeros(K)
+        X_gate = x_proxy[:-1]
+        y_gate = labels_sorted[1:]
+        present = np.unique(y_gate)
+        if present.size >= 2:
+            try:
+                lr = LogisticRegression(solver="lbfgs", C=1e4, max_iter=1000)
+                lr.fit(X_gate, y_gate)
+                coef = np.asarray(lr.coef_, dtype=float)
+                intr = np.asarray(lr.intercept_, dtype=float)
+                classes = [int(c) for c in lr.classes_]
+                if coef.shape[0] == 1 and len(classes) == 2:
+                    Rs_init[classes[1]] = coef[0]
+                    r_init[classes[1]] = intr[0]
+                else:
+                    for row, cls in enumerate(classes):
+                        Rs_init[cls] = coef[row]
+                        r_init[cls] = intr[row]
+            except Exception:
+                # logistic fit can fail on degenerate label sequences; fall back
+                # to a small perturbation so EM still has a non-zero gradient.
+                Rs_init = 0.1 * npr.randn(K, D)
+        else:
+            Rs_init = 0.1 * npr.randn(K, D)
+        mdl.transitions.Rs   = Rs_init
         if _rec_only:
             # gate bias exists only on the recurrent_only class; setting it on
             # StickyRecurrent would create a stray attribute and corrupt
             # transition-kind detection downstream.
-            mdl.transitions.r = np.zeros(K)
+            mdl.transitions.r = r_init
 
         # Data-driven persistence cap for the M-step. ssm's AR(1) dynamics
         # M-step trades drift (b) for persistence (A), walking A toward the
