@@ -653,7 +653,8 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
                              # the highest-ELBO iterate is retained as a drift guard.
     min_occupancy=0.05,      # per-regime usage floor; an EM run that drops the occupied-regime
                              # count below the closed-form's is rejected in favour of that fit
-    transition_kind="recurrent"):  # default: Eq.4 shared variant (nests SLDS at R=0);
+    transition_kind="recurrent",   # default: Eq.4 shared variant (nests SLDS at R=0);
+    sticky_kappa=_STICKY_KAPPA):   # Fox sticky self-transition weight; CONFIG-overridable
                              # "standard" -> SLDS (StickyStandard fixed matrix). Same kappa, same
                              # warm-up / EM / occupancy-revert: the ONLY difference is the gate form.
 
@@ -773,11 +774,11 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
     #   recurrent      -> StickyRecurrent      (Eq.4 shared variant, nests standard)
     #   standard       -> StickyStandard       (fixed K x K matrix)
     if _rec_only:
-        mdl.transitions = StickyRecurrentOnly(K, D, M=0, kappa=_STICKY_KAPPA)
+        mdl.transitions = StickyRecurrentOnly(K, D, M=0, kappa=sticky_kappa)
     elif _rec_full:
-        mdl.transitions = StickyRecurrent(K, D, M=0, kappa=_STICKY_KAPPA)
+        mdl.transitions = StickyRecurrent(K, D, M=0, kappa=sticky_kappa)
     else:
-        mdl.transitions = StickyStandard(K, D, M=0, kappa=_STICKY_KAPPA)
+        mdl.transitions = StickyStandard(K, D, M=0, kappa=sticky_kappa)
 
     # ----- emissions (fixed if C,d provided; else learned)
     fixed_emissions = (C is not None) and (d is not None)

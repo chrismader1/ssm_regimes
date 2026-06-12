@@ -69,6 +69,22 @@ def evaluate_regimes_synthetic(y, xhat, zhat, z_true, elbo, mdl, cpll, max_cpll,
     """
     T = len(zhat)
 
+    # ---- K==2 guardrail ----
+    # This evaluator hardcodes binary label-flipping (1 - zhat) and labels=[0, 1].
+    # Handed a K>2 path it would NOT error -- it would silently mis-flip and
+    # confusion_matrix would drop the extra states, producing wrong-but-plausible
+    # metrics. The paper restricts the bounds + recovery study to K=2, so we
+    # enforce that loudly here. For K>2 use evaluate_regimes_synthetic_kreg
+    # (Hungarian-matched), which is the K-generic path.
+    zt = np.asarray(z_true).ravel()
+    zh = np.asarray(zhat).ravel()
+    n_states = int(max(zt.max() if zt.size else 0, zh.max() if zh.size else 0)) + 1
+    if n_states > 2:
+        raise ValueError(
+            "evaluate_regimes_synthetic is K==2 only (binary label-flip + "
+            f"labels=[0,1]); saw {n_states} distinct states. Use "
+            "evaluate_regimes_synthetic_kreg for K>2.")
+
     # ---- Label-invariant matching ----
     flipped = False
     if label_invariant:
