@@ -198,7 +198,7 @@ def _estimate_masked_loadings(C, d, y, C_mask):
 # Fit rSLDS
 # ---------------------------------------------------------------
 
-def fit_rSLDS(y, params, n_iter_em=50, seed=None, transition_kind="recurrent_only"):
+def fit_rSLDS(y, params, n_iter_em=50, seed=None, transition_kind="recurrent"):
     
     """
     params: dict(n_regimes, dim_latent, single_subspace)
@@ -653,7 +653,7 @@ def fit_rSLDS_restricted_em(y, params, C=None, d=None, n_iter_em=10, seed=None,
                              # the highest-ELBO iterate is retained as a drift guard.
     min_occupancy=0.05,      # per-regime usage floor; an EM run that drops the occupied-regime
                              # count below the closed-form's is rejected in favour of that fit
-    transition_kind="recurrent_only",  # default: state-dependent gate nu = R.x + r (no fixed Markov term);
+    transition_kind="recurrent",   # default: full recurrent gate (Eq.4), nests sticky SLDS at R=0;
     sticky_kappa=_STICKY_KAPPA):   # Fox sticky self-transition weight; CONFIG-overridable
                              # "standard" -> SLDS (StickyStandard fixed matrix). Same kappa, same
                              # warm-up / EM / occupancy-revert: the ONLY difference is the gate form.
